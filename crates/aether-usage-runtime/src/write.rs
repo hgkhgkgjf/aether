@@ -619,6 +619,10 @@ fn build_terminal_usage_event_from_seed_impl(
         }
     }
 
+    if matches!(event_type, UsageEventType::Completed) {
+        apply_completed_image_usage_estimate(&mut data);
+    }
+
     if matches!(event_type, UsageEventType::Cancelled) {
         apply_cancelled_usage_estimate(&mut data);
     }
@@ -2290,6 +2294,63 @@ fn apply_cancelled_usage_estimate(data: &mut UsageEventData) {
     }
 }
 
+fn apply_completed_image_usage_estimate(data: &mut UsageEventData) {
+    if !usage_event_data_is_image(data) {
+        return;
+    }
+    if data
+        .response_body
+        .as_ref()
+        .and_then(extract_token_counts_from_value)
+        .is_some()
+    {
+        return;
+    }
+    let request_usage = data
+        .provider_request_body
+        .as_ref()
+        .or(data.request_body.as_ref())
+        .and_then(estimate_request_usage);
+
+    if positive_tokens(data.input_tokens) == 0 {
+        if let Some(usage) = request_usage.as_ref() {
+            data.input_tokens = Some(usage.input_tokens);
+        }
+    }
+    apply_cancelled_request_cache_estimate(data, request_usage.as_ref());
+    if positive_tokens(data.total_tokens) == 0 {
+        let total_tokens =
+            positive_tokens(data.input_tokens).saturating_add(positive_tokens(data.output_tokens));
+        if total_tokens > 0 {
+            data.total_tokens = Some(total_tokens);
+        }
+    }
+}
+
+fn usage_event_data_is_image(data: &UsageEventData) -> bool {
+    data.request_type
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("image"))
+        || data
+            .endpoint_kind
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("image"))
+        || data
+            .provider_endpoint_kind
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("image"))
+        || data
+            .endpoint_api_format
+            .as_deref()
+            .and_then(infer_endpoint_kind)
+            .is_some_and(|value| value.eq_ignore_ascii_case("image"))
+        || data
+            .api_format
+            .as_deref()
+            .and_then(infer_endpoint_kind)
+            .is_some_and(|value| value.eq_ignore_ascii_case("image"))
+}
+
 fn apply_cancelled_request_cache_estimate(
     data: &mut UsageEventData,
     request_usage: Option<&EstimatedRequestUsage>,
@@ -3640,6 +3701,94 @@ mod tests {
         assert_eq!(event.data.cache_read_input_tokens, Some(3));
         assert!(event.data.response_body.is_none());
         assert!(event.data.client_response_body.is_none());
+    }
+
+    #[test]
+    fn completed_image_usage_estimates_request_tokens_when_provider_usage_is_missing() {
+        let plan = ExecutionPlan {
+            request_id: "req-image-completed-estimate-1".to_string(),
+            candidate_id: Some("cand-image-completed-estimate-1".to_string()),
+            provider_name: Some("OpenAI".to_string()),
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+            method: "POST".to_string(),
+            url: "https://example.com/v1/images/generations".to_string(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({
+                "model": "gpt-image-2",
+                "prompt": "draw a small red cube on a clean desk",
+                "size": "1024x1024",
+                "quality": "medium"
+            })),
+            stream: true,
+            client_api_format: "openai:chat".to_string(),
+            provider_api_format: "openai:image".to_string(),
+            model_name: Some("gpt-image-2".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let mut standardized_usage = StandardizedUsage::new();
+        standardized_usage.request_count = 1;
+        standardized_usage
+            .dimensions
+            .insert("image_count".to_string(), json!(1));
+        standardized_usage
+            .dimensions
+            .insert("image_size".to_string(), json!("1024x1024"));
+        standardized_usage
+            .dimensions
+            .insert("image_quality".to_string(), json!("medium"));
+        let payload = GatewayStreamReportRequest {
+            trace_id: "trace-image-completed-estimate-1".to_string(),
+            report_kind: "openai_chat_stream_success".to_string(),
+            report_context: Some(json!({
+                "client_api_format": "openai:chat",
+                "provider_api_format": "openai:image",
+                "image_request": {
+                    "size": "1024x1024",
+                    "quality": "medium"
+                }
+            })),
+            status_code: 200,
+            headers: BTreeMap::new(),
+            provider_body_base64: None,
+            provider_body_state: Some(UsageBodyCaptureState::None),
+            client_body_base64: None,
+            client_body_state: Some(UsageBodyCaptureState::None),
+            terminal_summary: Some(ExecutionStreamTerminalSummary {
+                standardized_usage: Some(standardized_usage),
+                finish_reason: Some("stop".to_string()),
+                response_id: Some("resp_image_estimate_1".to_string()),
+                model: Some("gpt-image-2".to_string()),
+                observed_finish: true,
+                unknown_event_count: 0,
+                parser_error: None,
+            }),
+            telemetry: None,
+        };
+
+        let event =
+            build_stream_terminal_usage_event(&plan, payload.report_context.as_ref(), &payload)
+                .expect("usage event should build");
+
+        assert_eq!(event.event_type, UsageEventType::Completed);
+        assert!(event.data.input_tokens.unwrap_or_default() > 0);
+        assert_eq!(event.data.output_tokens.unwrap_or_default(), 0);
+        assert_eq!(event.data.total_tokens, event.data.input_tokens);
+        assert_eq!(
+            event
+                .data
+                .request_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("dimensions"))
+                .and_then(|dimensions| dimensions.get("image_count"))
+                .and_then(Value::as_i64),
+            Some(1)
+        );
     }
 
     #[test]
