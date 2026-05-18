@@ -221,6 +221,7 @@ export interface ApiKey {
   feature_settings?: FeatureSettings | null
   rate_limit?: number | null  // 普通Key: 0 = 不限制，历史 null 视为跟随系统默认
   concurrent_limit?: number | null  // 普通Key: 0 = 不限制并发，历史 null 兼容
+  allowed_ips?: string[] | null
   total_requests?: number  // 总请求数
   total_cost_usd?: number  // 总费用
 }
@@ -229,6 +230,7 @@ export interface UpsertUserApiKeyRequest {
   name?: string
   rate_limit?: number | null
   concurrent_limit?: number | null
+  allowed_ips?: string[] | null
   feature_settings?: FeatureSettings | null
 }
 
