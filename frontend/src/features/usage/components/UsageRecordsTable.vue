@@ -1120,6 +1120,7 @@ function formatClientFamily(value: string | null | undefined): string {
   if (normalized === 'claude_code') return 'Claude Code'
   if (normalized === 'opencode') return 'OpenCode'
   if (normalized === 'gemini_cli') return 'Gemini CLI'
+  if (normalized === 'openai_js_sdk') return 'OpenAI JS SDK'
   if (normalized === 'generic') return '通用客户端'
   return value?.trim() || '-'
 }
