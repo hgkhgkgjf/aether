@@ -13,7 +13,8 @@ use crate::claude_code::build_claude_code_messages_url;
 use crate::snapshot::GatewayProviderTransportSnapshot;
 use crate::url::{
     build_claude_messages_url, build_gemini_content_url, build_openai_chat_url,
-    build_openai_responses_url, build_passthrough_path_url, normalize_gemini_content_action_path,
+    build_openai_responses_url, build_passthrough_path_url,
+    google_openai_compat_base_includes_api_root, normalize_gemini_content_action_path,
 };
 use crate::vertex::{
     build_vertex_api_key_gemini_content_url, build_vertex_api_key_gemini_embedding_url,
@@ -409,7 +410,9 @@ fn build_provider_v1_url(
         .map(|(base, _)| base)
         .unwrap_or_else(|| upstream_base_url.trim())
         .trim_end_matches('/');
-    let path = if base_without_query.ends_with("/v1") {
+    let path = if base_without_query.ends_with("/v1")
+        || google_openai_compat_base_includes_api_root(base_without_query)
+    {
         v1_path
     } else {
         default_path
@@ -994,6 +997,53 @@ mod tests {
             )
             .as_deref(),
             Some("https://ark.volces.example/api/v3/embeddings")
+        );
+    }
+
+    #[test]
+    fn embedding_request_url_preserves_google_openai_compat_roots() {
+        let developer_api_openai = sample_transport(
+            "custom",
+            "openai:embedding",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            None,
+        );
+        let vertex_openai = sample_transport(
+            "custom",
+            "openai:embedding",
+            "https://aiplatform.googleapis.com/v1/projects/project-1/locations/global/endpoints/openapi",
+            None,
+        );
+
+        assert_eq!(
+            build_transport_request_url(
+                &developer_api_openai,
+                TransportRequestUrlParams {
+                    provider_api_format: "openai:embedding",
+                    mapped_model: Some("gemini-embedding-001"),
+                    upstream_is_stream: false,
+                    request_query: Some("trace=1"),
+                    kiro_api_region: None,
+                },
+            )
+            .as_deref(),
+            Some("https://generativelanguage.googleapis.com/v1beta/openai/embeddings?trace=1")
+        );
+        assert_eq!(
+            build_transport_request_url(
+                &vertex_openai,
+                TransportRequestUrlParams {
+                    provider_api_format: "openai:embedding",
+                    mapped_model: Some("gemini-embedding-001"),
+                    upstream_is_stream: false,
+                    request_query: None,
+                    kiro_api_region: None,
+                },
+            )
+            .as_deref(),
+            Some(
+                "https://aiplatform.googleapis.com/v1/projects/project-1/locations/global/endpoints/openapi/embeddings"
+            )
         );
     }
 
