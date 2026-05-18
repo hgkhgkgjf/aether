@@ -1031,23 +1031,32 @@ fn infer_client_family_from_user_agent(user_agent: &str) -> Option<&'static str>
     if normalized.contains("geminicli") || normalized.contains("gemini-cli") {
         return Some("gemini_cli");
     }
+    if normalized.starts_with("openai/js") {
+        return Some("openai_js_sdk");
+    }
     None
 }
 
 pub fn admin_usage_client_family(item: &StoredRequestUsageAudit) -> Option<&str> {
-    item.request_metadata
-        .as_ref()
-        .and_then(Value::as_object)
-        .and_then(|metadata| {
-            metadata
-                .get("client_session_affinity")
-                .and_then(Value::as_object)
-                .and_then(|affinity| affinity.get("client_family"))
-                .and_then(Value::as_str)
-                .or_else(|| metadata.get("client_family").and_then(Value::as_str))
-        })
+    item.client_family
+        .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        .or_else(|| {
+            item.request_metadata
+                .as_ref()
+                .and_then(Value::as_object)
+                .and_then(|metadata| {
+                    metadata
+                        .get("client_session_affinity")
+                        .and_then(Value::as_object)
+                        .and_then(|affinity| affinity.get("client_family"))
+                        .and_then(Value::as_str)
+                        .or_else(|| metadata.get("client_family").and_then(Value::as_str))
+                })
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
         .or_else(|| {
             admin_usage_metadata_string(item, "user_agent")
                 .and_then(infer_client_family_from_user_agent)
@@ -2485,6 +2494,49 @@ mod tests {
         assert_eq!(record["client_family"], "codex_vscode");
         assert_eq!(record["client_ip"], "192.168.0.28");
         assert_eq!(active["client_family"], "codex_vscode");
+    }
+
+    #[test]
+    fn admin_usage_record_labels_openai_js_user_agent_as_sdk() {
+        let item = StoredRequestUsageAudit {
+            request_metadata: Some(json!({
+                "user_agent": "OpenAI/JS 6.34.0"
+            })),
+            ..sample_usage("completed", Some(200), None)
+        };
+
+        let record = admin_usage_record_json(
+            &item,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+            None,
+        );
+
+        assert_eq!(record["client_family"], "openai_js_sdk");
+    }
+
+    #[test]
+    fn admin_usage_record_prefers_typed_client_family() {
+        let item = StoredRequestUsageAudit {
+            client_family: Some("codex".to_string()),
+            request_metadata: Some(json!({
+                "user_agent": "OpenAI/JS 6.34.0"
+            })),
+            ..sample_usage("completed", Some(200), None)
+        };
+
+        let record = admin_usage_record_json(
+            &item,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+            None,
+        );
+
+        assert_eq!(record["client_family"], "codex");
     }
 
     #[test]
