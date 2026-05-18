@@ -912,6 +912,19 @@ export const adminApi = {
     return response.data
   },
 
+  async testImportantNotification(channel: 'all' | 'email' | 'server_chan' = 'all'): Promise<{
+    success: boolean
+    message: string
+    channels: Array<{ channel: string; success: boolean; message: string }>
+  }> {
+    const response = await apiClient.post<{
+      success: boolean
+      message: string
+      channels: Array<{ channel: string; success: boolean; message: string }>
+    }>('/api/admin/system/important-notification/test', { channel })
+    return response.data
+  },
+
   // 邮件模板相关
   // 获取所有邮件模板
   async getEmailTemplates(): Promise<EmailTemplatesResponse> {

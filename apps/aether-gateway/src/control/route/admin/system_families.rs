@@ -103,6 +103,16 @@ pub(super) fn classify_admin_system_family_route(
             "admin:system",
             false,
         ))
+    } else if method == http::Method::POST
+        && normalized_path == "/api/admin/system/important-notification/test"
+    {
+        Some(classified(
+            "admin_proxy",
+            "system_manage",
+            "important_notification_test",
+            "admin:system",
+            false,
+        ))
     } else if method == http::Method::POST && normalized_path == "/api/admin/system/cleanup" {
         Some(classified(
             "admin_proxy",

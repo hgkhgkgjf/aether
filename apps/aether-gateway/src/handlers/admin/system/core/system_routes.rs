@@ -17,6 +17,7 @@ use crate::handlers::admin::system::shared::settings::{
     build_admin_system_stats_payload, current_aether_version, fetch_latest_admin_system_release,
 };
 use crate::handlers::admin::system::shared::smtp::build_admin_smtp_test_payload;
+use crate::important_notification::build_important_notification_test_payload;
 use crate::maintenance::{ManualUsageCleanupMode, ManualUsageCleanupOptions};
 use crate::GatewayError;
 use aether_data_contracts::repository::usage::UsageCleanupTargets;
@@ -238,6 +239,16 @@ pub(super) async fn maybe_build_local_admin_core_system_response(
     {
         return Ok(Some(
             Json(build_admin_smtp_test_payload(state, request_body).await?).into_response(),
+        ));
+    }
+
+    if decision.route_kind.as_deref() == Some("important_notification_test")
+        && request_method == http::Method::POST
+        && request_path == "/api/admin/system/important-notification/test"
+    {
+        return Ok(Some(
+            Json(build_important_notification_test_payload(state, request_body).await?)
+                .into_response(),
         ));
     }
 

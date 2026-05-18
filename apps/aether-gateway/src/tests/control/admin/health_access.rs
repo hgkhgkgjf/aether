@@ -754,6 +754,14 @@ async fn gateway_handles_admin_modules_status_locally_with_trusted_admin_princip
         .with_system_config_values_for_tests(vec![
             ("module.oauth.enabled".to_string(), json!(true)),
             ("module.management_tokens.enabled".to_string(), json!(true)),
+            (
+                "module.important_notification.email_enabled".to_string(),
+                json!(true),
+            ),
+            (
+                "module.important_notification.email_recipients".to_string(),
+                json!("ops@example.com"),
+            ),
             ("smtp_host".to_string(), json!("smtp.example.com")),
             ("smtp_from_email".to_string(), json!("ops@example.com")),
         ]);
@@ -796,8 +804,12 @@ async fn gateway_handles_admin_modules_status_locally_with_trusted_admin_princip
         "/admin/modules/chat-pii-redaction"
     );
     assert_eq!(
-        payload["notification_email"]["config_validated"],
+        payload["important_notification"]["config_validated"],
         json!(true)
+    );
+    assert_eq!(
+        payload["important_notification"]["admin_route"],
+        "/admin/modules/important-notification"
     );
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
@@ -828,6 +840,14 @@ async fn gateway_handles_admin_modules_status_locally_with_bearer_admin_session(
         .with_system_config_values_for_tests(vec![
             ("module.oauth.enabled".to_string(), json!(true)),
             ("module.management_tokens.enabled".to_string(), json!(true)),
+            (
+                "module.important_notification.email_enabled".to_string(),
+                json!(true),
+            ),
+            (
+                "module.important_notification.email_recipients".to_string(),
+                json!("ops@example.com"),
+            ),
             ("smtp_host".to_string(), json!("smtp.example.com")),
             ("smtp_from_email".to_string(), json!("ops@example.com")),
         ]);
@@ -855,7 +875,7 @@ async fn gateway_handles_admin_modules_status_locally_with_bearer_admin_session(
     assert_eq!(payload["oauth"]["config_validated"], json!(true));
     assert_eq!(payload["management_tokens"]["active"], json!(true));
     assert_eq!(
-        payload["notification_email"]["config_validated"],
+        payload["important_notification"]["config_validated"],
         json!(true)
     );
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);

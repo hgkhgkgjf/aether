@@ -253,6 +253,17 @@ const routes: RouteRecordRaw[] = [
         meta: { module: 'chat_pii_redaction' }
       },
       {
+        path: 'modules/important-notification',
+        name: 'ImportantNotificationModule',
+        component: () => importWithRetry(() => import('@/views/admin/modules/ImportantNotification.vue')),
+        meta: { module: 'important_notification' }
+      },
+      {
+        path: 'server-chan',
+        name: 'ServerChanSettings',
+        component: () => importWithRetry(() => import('@/views/admin/modules/ServerChanSettings.vue'))
+      },
+      {
         path: 'email',
         name: 'EmailSettings',
         component: () => importWithRetry(() => import('@/views/admin/EmailSettings.vue'))

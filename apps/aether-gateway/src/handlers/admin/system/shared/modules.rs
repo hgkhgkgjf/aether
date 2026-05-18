@@ -1,5 +1,9 @@
 use crate::handlers::admin::request::AdminAppState;
 use crate::handlers::shared::{module_available_from_env, system_config_bool};
+use crate::important_notification::{
+    important_notification_configured, IMPORTANT_NOTIFICATION_ENABLED_KEY,
+    LEGACY_NOTIFICATION_EMAIL_ENABLED_KEY,
+};
 use crate::system_features::ENABLE_MODEL_DIRECTIVES_CONFIG_KEY;
 use crate::GatewayError;
 use aether_admin::system as admin_system_kernel;
@@ -68,14 +72,14 @@ pub(crate) const ADMIN_MODULE_DEFINITIONS: &[AdminModuleDefinition] = &[
         admin_menu_order: 59,
     },
     AdminModuleDefinition {
-        name: "notification_email",
-        display_name: "异常通知",
-        description: "为 5xx 异常发送邮件通知，可在模块管理中启用或禁用",
+        name: "important_notification",
+        display_name: "重要通知",
+        description: "统一发送邮件和 Server 酱重要通知，供额度提醒等后台任务使用",
         category: "integration",
         env_key: "NOTIFICATION_EMAIL_AVAILABLE",
         default_available: true,
-        admin_route: None,
-        admin_menu_icon: Some("Mail"),
+        admin_route: Some("/admin/modules/important-notification"),
+        admin_menu_icon: Some("BellRing"),
         admin_menu_group: Some("system"),
         admin_menu_order: 58,
     },
@@ -126,10 +130,15 @@ pub(crate) struct AdminModuleRuntimeState {
     oauth_providers: Vec<aether_data::repository::auth_modules::StoredOAuthProviderModuleConfig>,
     ldap_config: Option<aether_data::repository::auth_modules::StoredLdapModuleConfig>,
     gemini_files_has_capable_key: bool,
-    smtp_configured: bool,
+    important_notification_configured: bool,
 }
 
 pub(crate) fn admin_module_by_name(name: &str) -> Option<&'static AdminModuleDefinition> {
+    let name = if name == "notification_email" {
+        "important_notification"
+    } else {
+        name
+    };
     ADMIN_MODULE_DEFINITIONS
         .iter()
         .find(|module| module.name == name)
@@ -146,6 +155,8 @@ pub(crate) fn admin_module_name_from_enabled_path(request_path: &str) -> Option<
 pub(crate) fn admin_module_enabled_config_key(module: &AdminModuleDefinition) -> String {
     if module.name == "model_directives" {
         ENABLE_MODEL_DIRECTIVES_CONFIG_KEY.to_string()
+    } else if module.name == "important_notification" {
+        IMPORTANT_NOTIFICATION_ENABLED_KEY.to_string()
     } else {
         format!("module.{}.enabled", module.name)
     }
@@ -197,28 +208,13 @@ pub(crate) async fn build_admin_module_runtime_state(
             })
     };
 
-    let smtp_host = state.read_system_config_json_value("smtp_host").await?;
-    let smtp_from_email = state
-        .read_system_config_json_value("smtp_from_email")
-        .await?;
-    let smtp_configured = smtp_host
-        .as_ref()
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_some()
-        && smtp_from_email
-            .as_ref()
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .is_some();
+    let notification_configured = important_notification_configured(state.app()).await?;
 
     Ok(AdminModuleRuntimeState {
         oauth_providers,
         ldap_config,
         gemini_files_has_capable_key,
-        smtp_configured,
+        important_notification_configured: notification_configured,
     })
 }
 
@@ -231,7 +227,7 @@ pub(crate) fn build_admin_module_validation_result(
         &runtime.oauth_providers,
         runtime.ldap_config.as_ref(),
         runtime.gemini_files_has_capable_key,
-        runtime.smtp_configured,
+        runtime.important_notification_configured,
     )
 }
 
@@ -252,10 +248,17 @@ pub(crate) async fn build_admin_module_status_payload(
 ) -> Result<serde_json::Value, GatewayError> {
     let available = module_available_from_env(module.env_key, module.default_available);
     let enabled = if available {
-        let enabled = state
+        let enabled_value = state
             .read_system_config_json_value(&admin_module_enabled_config_key(module))
             .await?;
-        system_config_bool(enabled.as_ref(), false)
+        let enabled_value = if module.name == "important_notification" && enabled_value.is_none() {
+            state
+                .read_system_config_json_value(LEGACY_NOTIFICATION_EMAIL_ENABLED_KEY)
+                .await?
+        } else {
+            enabled_value
+        };
+        system_config_bool(enabled_value.as_ref(), false)
     } else {
         false
     };

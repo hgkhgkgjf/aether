@@ -183,6 +183,10 @@ fn classifies_admin_system_maintenance_write_routes_as_admin_proxy_route() {
         ("/api/admin/system/users/import", "users_import"),
         ("/api/admin/system/data/import", "data_import"),
         ("/api/admin/system/smtp/test", "smtp_test"),
+        (
+            "/api/admin/system/important-notification/test",
+            "important_notification_test",
+        ),
         ("/api/admin/system/cleanup", "cleanup"),
         ("/api/admin/system/purge/config", "purge_config"),
         ("/api/admin/system/purge/users", "purge_users"),
