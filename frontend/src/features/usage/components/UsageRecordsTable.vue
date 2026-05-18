@@ -293,7 +293,10 @@
     </div>
 
     <!-- 桌面端表格视图 -->
-    <Table :class="['hidden md:table table-fixed w-full', isAdmin ? 'min-w-[1120px]' : 'min-w-[960px]']">
+    <Table
+      class="hidden md:table table-fixed w-full"
+      :class="[isAdmin ? 'min-w-[1120px]' : 'min-w-[960px]']"
+    >
       <colgroup v-if="isAdmin">
         <col class="w-[8%]">
         <col class="w-[12%]">
@@ -346,7 +349,8 @@
             密钥
           </TableHead>
           <SortableTableHead
-            :class="['h-12 font-semibold', isAdmin ? 'w-[14%]' : 'w-[22%]']"
+            class="h-12 font-semibold"
+            :class="[isAdmin ? 'w-[14%]' : 'w-[22%]']"
             column-key="model"
             :sortable="false"
             :filter-active="filterModel !== '__all__'"
@@ -383,7 +387,8 @@
             </template>
           </SortableTableHead>
           <SortableTableHead
-            :class="['h-12 font-semibold', isAdmin ? 'w-[15%]' : 'w-[14%]']"
+            class="h-12 font-semibold"
+            :class="[isAdmin ? 'w-[15%]' : 'w-[14%]']"
             column-key="api_format"
             :sortable="false"
             :filter-active="filterApiFormat !== '__all__'"
@@ -495,7 +500,8 @@
             </div>
           </TableCell>
           <TableCell
-            :class="['font-medium py-4', isAdmin ? 'w-[14%]' : 'w-[22%]']"
+            class="font-medium py-4"
+            :class="[isAdmin ? 'w-[14%]' : 'w-[22%]']"
             :title="getModelTooltip(record)"
           >
             <div
@@ -582,7 +588,8 @@
             </div>
           </TableCell>
           <TableCell
-            :class="['py-4', isAdmin ? 'w-[15%]' : 'w-[14%]']"
+            class="py-4"
+            :class="[isAdmin ? 'w-[15%]' : 'w-[14%]']"
             :title="getApiFormatTooltip(record)"
           >
             <!-- 有格式转换或同族格式差异：两行显示 -->
@@ -682,8 +689,8 @@
             </div>
             <div class="mt-0.5 grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] gap-x-1 text-xs leading-tight tabular-nums text-muted-foreground">
               <span
+                class="justify-self-end whitespace-nowrap text-right"
                 :class="[
-                  'justify-self-end whitespace-nowrap text-right',
                   hasPositiveTokens(getRecordCacheReadTokens(record)) ? 'text-foreground/70' : ''
                 ]"
               >
@@ -693,8 +700,8 @@
                 /
               </span>
               <span
+                class="justify-self-start whitespace-nowrap text-left"
                 :class="[
-                  'justify-self-start whitespace-nowrap text-left',
                   hasPositiveTokens(getRecordCacheCreationTokens(record)) ? 'text-foreground/70' : ''
                 ]"
               >
