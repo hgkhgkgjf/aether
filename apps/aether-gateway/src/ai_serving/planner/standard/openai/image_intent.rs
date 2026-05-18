@@ -7,24 +7,11 @@ pub(crate) fn openai_request_is_image_generation_intent(
             .get("model")
             .and_then(serde_json::Value::as_str)
             .is_some_and(openai_model_is_image_generation)
-        || openai_tools_contain_image_generation(body_json.get("tools"))
         || openai_tool_choice_selects_image_generation(body_json.get("tool_choice"))
 }
 
 fn openai_model_is_image_generation(model: &str) -> bool {
     model.trim().to_ascii_lowercase().starts_with("gpt-image-")
-}
-
-fn openai_tools_contain_image_generation(tools: Option<&serde_json::Value>) -> bool {
-    tools
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|items| {
-            items.iter().any(|item| {
-                item.get("type")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|value| value.trim().eq_ignore_ascii_case("image_generation"))
-            })
-        })
 }
 
 fn openai_tool_choice_selects_image_generation(choice: Option<&serde_json::Value>) -> bool {
@@ -70,11 +57,15 @@ mod tests {
         ));
         assert!(openai_request_is_image_generation_intent(
             "gpt-5",
-            &json!({"tools":[{"type":"image_generation"}]})
+            &json!({"tool_choice":{"function":{"name":"image_generation"}}})
         ));
         assert!(openai_request_is_image_generation_intent(
             "gpt-5",
-            &json!({"tool_choice":{"function":{"name":"image_generation"}}})
+            &json!({"tool_choice":{"type":"image_generation"}})
+        ));
+        assert!(!openai_request_is_image_generation_intent(
+            "gpt-5",
+            &json!({"tools":[{"type":"image_generation"}]})
         ));
         assert!(!openai_request_is_image_generation_intent(
             "gpt-5",
