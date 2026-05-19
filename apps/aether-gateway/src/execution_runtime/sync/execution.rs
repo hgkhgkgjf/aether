@@ -14,7 +14,7 @@ use aether_scheduler_core::{
 };
 use aether_usage_runtime::{
     build_lifecycle_usage_seed, build_sync_terminal_usage_payload_seed,
-    build_terminal_usage_context_seed,
+    build_terminal_usage_context_seed, build_usage_event_data_seed, UsageEvent, UsageEventType,
 };
 use async_stream::stream;
 use axum::body::{to_bytes, Body, Bytes};
@@ -100,6 +100,158 @@ struct SyncExecutionFailure {
     latency_ms: Option<u64>,
 }
 
+struct SyncAttemptTerminalGuard {
+    state: AppState,
+    plan: ExecutionPlan,
+    report_context: Option<Value>,
+    candidate_started_unix_ms: u64,
+    armed: bool,
+}
+
+impl SyncAttemptTerminalGuard {
+    fn new(
+        state: &AppState,
+        plan: &ExecutionPlan,
+        report_context: Option<Value>,
+        candidate_started_unix_ms: u64,
+    ) -> Self {
+        Self {
+            state: state.clone(),
+            plan: plan.clone(),
+            report_context,
+            candidate_started_unix_ms,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    async fn fail_and_disarm(&mut self, error: &GatewayError) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        record_sync_attempt_forced_terminal_state(
+            self.state.clone(),
+            self.plan.clone(),
+            self.report_context.clone(),
+            self.candidate_started_unix_ms,
+            UsageEventType::Failed,
+            RequestCandidateStatus::Failed,
+            StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+            "local_sync_attempt_aborted",
+            format!("Local sync attempt failed before terminal finalization: {error:?}"),
+        )
+        .await;
+    }
+}
+
+impl Drop for SyncAttemptTerminalGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        let state = self.state.clone();
+        let plan = self.plan.clone();
+        let report_context = self.report_context.clone();
+        let candidate_started_unix_ms = self.candidate_started_unix_ms;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                record_sync_attempt_forced_terminal_state(
+                    state,
+                    plan,
+                    report_context,
+                    candidate_started_unix_ms,
+                    UsageEventType::Cancelled,
+                    RequestCandidateStatus::Cancelled,
+                    499,
+                    "local_sync_attempt_cancelled",
+                    "Local sync attempt was dropped before terminal finalization, usually because the client disconnected or the request task was cancelled.",
+                )
+                .await;
+            });
+        } else {
+            warn!(
+                event_name = "local_sync_attempt_terminal_guard_no_runtime",
+                log_type = "ops",
+                request_id = %short_request_id(self.plan.request_id.as_str()),
+                candidate_id = ?self.plan.candidate_id,
+                "gateway could not finalize dropped local sync attempt because no Tokio runtime is available"
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_sync_attempt_forced_terminal_state(
+    state: AppState,
+    plan: ExecutionPlan,
+    report_context: Option<Value>,
+    candidate_started_unix_ms: u64,
+    usage_event_type: UsageEventType,
+    candidate_status: RequestCandidateStatus,
+    status_code: u16,
+    error_type: &'static str,
+    error_message: impl Into<String>,
+) {
+    let error_message = error_message.into();
+    let terminal_unix_ms = current_request_candidate_unix_ms();
+    let latency_ms = terminal_unix_ms.saturating_sub(candidate_started_unix_ms);
+    record_local_request_candidate_status(
+        &state,
+        &plan,
+        report_context.as_ref(),
+        SchedulerRequestCandidateStatusUpdate {
+            status: candidate_status,
+            status_code: Some(status_code),
+            error_type: Some(error_type.to_string()),
+            error_message: Some(error_message.clone()),
+            latency_ms: Some(latency_ms),
+            started_at_unix_ms: Some(candidate_started_unix_ms),
+            finished_at_unix_ms: Some(terminal_unix_ms),
+        },
+    )
+    .await;
+
+    if !state.usage_runtime.is_enabled() {
+        return;
+    }
+
+    let mut usage_data = build_usage_event_data_seed(&plan, report_context.as_ref());
+    usage_data.status_code = Some(status_code);
+    usage_data.error_message = Some(error_message.clone());
+    usage_data.error_category = Some(
+        match usage_event_type {
+            UsageEventType::Cancelled => "cancelled",
+            _ => "server_error",
+        }
+        .to_string(),
+    );
+    usage_data.response_time_ms = Some(latency_ms);
+    let error_body = json!({
+        "error": {
+            "type": error_type,
+            "message": error_message,
+            "code": status_code
+        }
+    });
+    usage_data.response_headers = Some(json!({"content-type": "application/json"}));
+    usage_data.response_body = Some(error_body.clone());
+    usage_data.client_response_headers = Some(json!({"content-type": "application/json"}));
+    usage_data.client_response_body = Some(error_body);
+
+    state
+        .usage_runtime
+        .record_terminal_event_direct(
+            state.data.as_ref(),
+            UsageEvent::new(usage_event_type, plan.request_id.clone(), usage_data),
+        )
+        .await;
+}
+
 impl SyncExecutionFailure {
     fn from_transport(err: ExecutionRuntimeTransportError) -> Self {
         Self {
@@ -138,6 +290,17 @@ fn record_sync_terminal_usage(
     state
         .usage_runtime
         .record_sync_terminal(state.data.as_ref(), context_seed, payload_seed);
+}
+
+fn record_sync_terminal_usage_and_disarm_guard(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    report_context: Option<&serde_json::Value>,
+    payload: &GatewaySyncReportRequest,
+    terminal_guard: &mut SyncAttemptTerminalGuard,
+) {
+    record_sync_terminal_usage(state, plan, report_context, payload);
+    terminal_guard.disarm();
 }
 
 fn with_sync_error_trace_context(
@@ -1143,6 +1306,13 @@ async fn execute_execution_runtime_sync_impl(
         },
     )
     .await;
+    let mut terminal_guard = SyncAttemptTerminalGuard::new(
+        state,
+        &plan,
+        report_context.clone(),
+        candidate_started_unix_secs,
+    );
+    let result = (async {
     let _provider_pool_in_flight_guard = acquire_provider_pool_in_flight_guard(
         state.runtime_state.clone(),
         &plan.provider_id,
@@ -1837,11 +2007,12 @@ async fn execute_execution_runtime_sync_impl(
             usage_payload,
         )
         .await;
-        record_sync_terminal_usage(
+        record_sync_terminal_usage_and_disarm_guard(
             state,
             &plan,
             implicit_finalize.payload.report_context.as_ref(),
             usage_payload,
+            &mut terminal_guard,
         );
         if let Some(report_payload) = implicit_finalize.outcome.background_report {
             spawn_sync_report(state.clone(), report_payload);
@@ -1889,11 +2060,12 @@ async fn execute_execution_runtime_sync_impl(
                 )
                 .await;
             }
-            record_sync_terminal_usage(
+            record_sync_terminal_usage_and_disarm_guard(
                 state,
                 &plan,
                 payload.report_context.as_ref(),
                 usage_payload,
+                &mut terminal_guard,
             );
             if let Some(report_payload) = outcome.background_report {
                 spawn_sync_report(state.clone(), report_payload);
@@ -1934,11 +2106,12 @@ async fn execute_execution_runtime_sync_impl(
                     &report_payload,
                 )
                 .await;
-                record_sync_terminal_usage(
+                record_sync_terminal_usage_and_disarm_guard(
                     state,
                     &plan,
                     original_report_context.as_ref(),
                     &report_payload,
+                    &mut terminal_guard,
                 );
                 if let Some(snapshot) = local_task_snapshot {
                     let _ = state.upsert_video_task_snapshot(&snapshot).await?;
@@ -1967,7 +2140,13 @@ async fn execute_execution_runtime_sync_impl(
                 resolve_local_sync_success_background_report_kind(payload.report_kind.as_str());
             apply_sync_success_effects(state, &plan, payload.report_context.as_ref(), &payload)
                 .await;
-            record_sync_terminal_usage(state, &plan, payload.report_context.as_ref(), &payload);
+            record_sync_terminal_usage_and_disarm_guard(
+                state,
+                &plan,
+                payload.report_context.as_ref(),
+                &payload,
+                &mut terminal_guard,
+            );
             state
                 .video_tasks
                 .apply_finalize_mutation(request_path, payload.report_kind.as_str());
@@ -2007,7 +2186,13 @@ async fn execute_execution_runtime_sync_impl(
             if let Some(error_report_kind) = background_error_report_kind {
                 payload.report_kind = error_report_kind.to_string();
             }
-            record_sync_terminal_usage(state, &plan, payload.report_context.as_ref(), &payload);
+            record_sync_terminal_usage_and_disarm_guard(
+                state,
+                &plan,
+                payload.report_context.as_ref(),
+                &payload,
+                &mut terminal_guard,
+            );
             if background_error_report_kind.is_some() {
                 spawn_sync_report(state.clone(), payload);
             } else {
@@ -2027,7 +2212,13 @@ async fn execute_execution_runtime_sync_impl(
                 candidate_id,
             )?));
         }
-        record_sync_terminal_usage(state, &plan, payload.report_context.as_ref(), &payload);
+        record_sync_terminal_usage_and_disarm_guard(
+            state,
+            &plan,
+            payload.report_context.as_ref(),
+            &payload,
+            &mut terminal_guard,
+        );
         let response =
             submit_local_core_error_or_sync_finalize(state, trace_id, decision, payload).await?;
         return Ok(Some(attach_control_metadata_headers(
@@ -2056,11 +2247,12 @@ async fn execute_execution_runtime_sync_impl(
         )
         .await;
     }
-    record_sync_terminal_usage(
+    record_sync_terminal_usage_and_disarm_guard(
         state,
         &plan,
         usage_payload.report_context.as_ref(),
         &usage_payload,
+        &mut terminal_guard,
     );
     let response = attach_control_metadata_headers(
         build_client_response_from_parts(
@@ -2078,6 +2270,14 @@ async fn execute_execution_runtime_sync_impl(
     }
 
     Ok(Some(response))
+    })
+    .await;
+    if let Err(error) = result.as_ref() {
+        terminal_guard.fail_and_disarm(error).await;
+    } else {
+        terminal_guard.disarm();
+    }
+    result
 }
 
 #[allow(clippy::too_many_arguments)] // mirrors sync execution context
@@ -2209,9 +2409,15 @@ async fn execute_sync_via_remote_execution_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
+    use aether_data::repository::usage::InMemoryUsageReadRepository;
+    use aether_data_contracts::repository::candidates::RequestCandidateReadRepository;
+    use aether_data_contracts::repository::usage::UsageReadRepository;
+    use aether_usage_runtime::UsageRuntimeConfig;
     use futures_util::{pin_mut, StreamExt as _};
     use serde_json::json;
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     fn test_openai_image_plan(stream: bool) -> ExecutionPlan {
         ExecutionPlan {
@@ -2270,6 +2476,101 @@ mod tests {
         .expect("empty Gemini 200 response should be rejected from plan format");
 
         assert!(message.contains("visible model output"));
+    }
+
+    #[tokio::test]
+    async fn sync_attempt_terminal_guard_marks_dropped_pending_attempt_cancelled() {
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
+        let mut plan = test_openai_image_plan(false);
+        plan.request_id = "sync-cancel-guard-request".to_string();
+        plan.candidate_id = None;
+        let mut report_context = Some(json!({
+            "candidate_index": 0,
+            "retry_index": 0,
+            "user_id": "user-cancel",
+            "api_key_id": "api-key-cancel",
+            "client_api_format": "openai:image",
+            "provider_api_format": "openai:image",
+            "request_path": "/v1/images/generations",
+            "request_path_and_query": "/v1/images/generations",
+            "upstream_url": "https://example.test/v1/images/generations",
+            "mapped_model": "gpt-image-2",
+        }));
+
+        ensure_execution_request_candidate_slot(&state, &mut plan, &mut report_context).await;
+        let started_at = current_request_candidate_unix_ms();
+        state.usage_runtime.record_pending(
+            state.data.as_ref(),
+            build_lifecycle_usage_seed(&plan, report_context.as_ref()),
+        );
+        record_local_request_candidate_status(
+            &state,
+            &plan,
+            report_context.as_ref(),
+            SchedulerRequestCandidateStatusUpdate {
+                status: RequestCandidateStatus::Pending,
+                status_code: None,
+                error_type: None,
+                error_message: None,
+                latency_ms: None,
+                started_at_unix_ms: Some(started_at),
+                finished_at_unix_ms: None,
+            },
+        )
+        .await;
+
+        {
+            let _guard =
+                SyncAttemptTerminalGuard::new(&state, &plan, report_context.clone(), started_at);
+        }
+
+        let mut stored_usage = None;
+        for _ in 0..50 {
+            if let Some(usage) = usage_repository
+                .find_by_request_id("sync-cancel-guard-request")
+                .await
+                .expect("usage should read")
+            {
+                if usage.status == "cancelled" {
+                    stored_usage = Some(usage);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let stored_usage = stored_usage.expect("cancelled usage should be recorded");
+        assert_eq!(stored_usage.status, "cancelled");
+        assert_eq!(stored_usage.billing_status, "void");
+        assert_eq!(stored_usage.status_code, Some(499));
+        assert_eq!(stored_usage.error_category.as_deref(), Some("cancelled"));
+
+        let stored_candidates = request_candidate_repository
+            .list_by_request_id("sync-cancel-guard-request")
+            .await
+            .expect("request candidates should read");
+        assert_eq!(stored_candidates.len(), 1);
+        assert_eq!(
+            stored_candidates[0].status,
+            RequestCandidateStatus::Cancelled
+        );
+        assert_eq!(stored_candidates[0].status_code, Some(499));
+        assert_eq!(
+            stored_candidates[0].error_type.as_deref(),
+            Some("local_sync_attempt_cancelled")
+        );
     }
 
     #[tokio::test]
