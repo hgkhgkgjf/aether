@@ -243,12 +243,12 @@
             <Checkbox
               :checked="isAllFilteredSelected"
               :indeterminate="isPartiallyFilteredSelected"
-              :disabled="filteredUsers.length === 0 || usersStore.loading"
+              :disabled="filteredUserCount === 0 || usersStore.loading"
               @update:checked="toggleSelectFiltered"
             />
             <span>全选筛选结果</span>
           </label>
-          <span>匹配 {{ filteredUsers.length }} 个，当前页 {{ paginatedUsers.length }} 个，已选 {{ selectedCount }} 个</span>
+          <span>匹配 {{ filteredUserCount }} 个，当前页 {{ paginatedUsers.length }} 个，已选 {{ selectedCount }} 个</span>
         </div>
         <div class="flex flex-wrap items-center gap-1.5">
           <Button
@@ -576,10 +576,10 @@
             </AvatarFallback>
           </Avatar>
           <p class="text-sm font-medium text-foreground">
-            {{ searchQuery || filterRole !== 'all' || filterStatus !== 'all' ? '未找到匹配的用户' : '暂无用户' }}
+            {{ searchQuery || filterRole !== 'all' || filterStatus !== 'all' || filterGroup !== 'all' ? '未找到匹配的用户' : '暂无用户' }}
           </p>
           <p
-            v-if="searchQuery || filterRole !== 'all' || filterStatus !== 'all'"
+            v-if="searchQuery || filterRole !== 'all' || filterStatus !== 'all' || filterGroup !== 'all'"
             class="mt-1 text-xs text-muted-foreground"
           >
             尝试调整筛选条件
@@ -812,11 +812,11 @@
       <!-- 分页控件 -->
       <Pagination
         :current="currentPage"
-        :total="filteredUsers.length"
+        :total="filteredUserCount"
         :page-size="pageSize"
         cache-key="users-page-size"
-        @update:current="currentPage = $event"
-        @update:page-size="pageSize = $event"
+        @update:current="handlePageChange"
+        @update:page-size="handlePageSizeChange"
       />
     </Card>
 
@@ -1575,8 +1575,8 @@ const showUserBatchDialog = ref(false)
 const showUserGroupsDialog = ref(false)
 
 const searchQuery = ref('')
-const filterRole = ref('all')
-const filterStatus = ref('all')
+const filterRole = ref<'all' | User['role']>('all')
+const filterStatus = ref<'all' | 'active' | 'inactive'>('all')
 const filterGroup = ref('all')
 const userGroups = ref<UserGroup[]>([])
 const userRoleFilterOptions = [
@@ -1600,7 +1600,7 @@ let userWalletsRequestId = 0
 const filteredUsers = computed(() => {
   let filtered = [...usersStore.users]
 
-  // 先排序：管理员优先，然后按创建时间倒序
+  // 当前页仍按原有视觉规则排序；筛选和分页由后端处理，避免只搜索首批 100 个用户。
   filtered.sort((a, b) => {
     const roleRank = (role: string) => role === 'admin' ? 0 : role === 'audit_admin' ? 1 : 2
     const roleDiff = roleRank(a.role) - roleRank(b.role)
@@ -1609,38 +1609,12 @@ const filteredUsers = computed(() => {
     return new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
   })
 
-  // 搜索（支持空格分隔的多关键词 AND 搜索）
-  if (searchQuery.value) {
-    const keywords = searchQuery.value.toLowerCase().split(/\s+/).filter(k => k.length > 0)
-    filtered = filtered.filter(u => {
-      const searchableText = `${u.username} ${u.email || ''}`.toLowerCase()
-      return keywords.every(keyword => searchableText.includes(keyword))
-    })
-  }
-
-  if (filterRole.value !== 'all') {
-    filtered = filtered.filter(u => u.role === filterRole.value)
-  }
-
-  if (filterStatus.value !== 'all') {
-    filtered = filtered.filter(u =>
-      filterStatus.value === 'active' ? u.is_active : !u.is_active
-    )
-  }
-
-  if (filterGroup.value !== 'all') {
-    filtered = filtered.filter(u => (u.groups || []).some(group => group.id === filterGroup.value))
-  }
-
   return filtered
 })
 
-const paginatedUsers = computed(() => {
-  const start = (currentPage.value - 1) * pageSize.value
-  return filteredUsers.value.slice(start, start + pageSize.value)
-})
+const paginatedUsers = computed(() => filteredUsers.value)
 
-const filteredUserCount = computed(() => filteredUsers.value.length)
+const filteredUserCount = computed(() => usersStore.total)
 const {
   selectedIds,
   selectAllFiltered,
@@ -1681,6 +1655,7 @@ const grantableBillingPlans = computed(() =>
 watch([searchQuery, filterRole, filterStatus, filterGroup], () => {
   currentPage.value = 1
   resetBatchSelection()
+  void refreshUsers()
 })
 
 watch(paginatedUsers, (users) => rememberBatchPageUsers(users), { immediate: true })
@@ -1701,13 +1676,34 @@ onMounted(() => {
 
 async function refreshUsers(options: { preferCache?: boolean } = {}) {
   const cacheTtlMs = options.preferCache ? USERS_PAGE_CACHE_TTL_MS : 0
+  const search = searchQuery.value.trim()
   await Promise.all([
-    usersStore.fetchUsers({ cacheTtlMs }),
+    usersStore.fetchUsers({
+      cacheTtlMs,
+      search: search || undefined,
+      role: filterRole.value === 'all' ? undefined : filterRole.value,
+      is_active: filterStatus.value === 'all' ? undefined : filterStatus.value === 'active',
+      group_id: filterGroup.value === 'all' ? undefined : filterGroup.value,
+      skip: (currentPage.value - 1) * pageSize.value,
+      limit: pageSize.value,
+    }),
     loadUserGroups(),
   ])
   void loadUserWallets({
     cacheTtlMs: options.preferCache ? USER_WALLETS_CACHE_TTL_MS : 0,
   })
+}
+
+function handlePageChange(page: number): void {
+  currentPage.value = page
+  void refreshUsers({ preferCache: true })
+}
+
+function handlePageSizeChange(size: number): void {
+  pageSize.value = size
+  currentPage.value = 1
+  resetBatchSelection()
+  void refreshUsers()
 }
 
 async function loadUserGroups(): Promise<void> {
