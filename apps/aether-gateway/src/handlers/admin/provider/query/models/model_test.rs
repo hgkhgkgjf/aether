@@ -564,6 +564,29 @@ fn provider_query_build_test_request_body_for_api_format(
                     client_api_format.as_str(),
                     payload,
                 );
+            } else if matches!(
+                client_api_format.as_str(),
+                "openai:responses" | "openai:responses:compact"
+            ) && !value_has_non_empty_text(object.get("input"))
+            {
+                if let Some(prompt) = object
+                    .remove("prompt")
+                    .filter(|value| value_has_non_empty_text(Some(value)))
+                {
+                    object.insert("input".to_string(), prompt);
+                }
+            }
+            if matches!(
+                client_api_format.as_str(),
+                "openai:responses" | "openai:responses:compact"
+            ) && value_has_non_empty_text(object.get("input"))
+            {
+                object.remove("prompt");
+            }
+            if client_api_format == "openai:responses:compact"
+                && value_has_non_empty_text(object.get("input"))
+            {
+                object.remove("messages");
             }
         }
         return body;
