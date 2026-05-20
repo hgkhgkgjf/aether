@@ -13,9 +13,8 @@ use crate::provider::{ProviderPoolAdapter, ProviderPoolMemberInput};
 use crate::providers::{
     AntigravityProviderPoolAdapter, ChatGptWebProviderPoolAdapter, CodexProviderPoolAdapter,
     DefaultProviderPoolAdapter, GrokProviderPoolAdapter, KiroProviderPoolAdapter,
-    WindsurfProviderPoolAdapter,
-    CLAUDE_CODE_PROVIDER_POOL_ADAPTER, GEMINI_CLI_PROVIDER_POOL_ADAPTER,
-    VERTEX_AI_PROVIDER_POOL_ADAPTER,
+    WindsurfProviderPoolAdapter, CLAUDE_CODE_PROVIDER_POOL_ADAPTER,
+    GEMINI_CLI_PROVIDER_POOL_ADAPTER, VERTEX_AI_PROVIDER_POOL_ADAPTER,
 };
 
 #[derive(Clone)]

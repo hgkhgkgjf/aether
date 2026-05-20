@@ -44,8 +44,8 @@ use crate::ai_serving::transport::{
     is_windsurf_provider_transport, local_standard_transport_unsupported_reason_with_network,
     local_windsurf_request_transport_unsupported_reason_with_network,
     openai_image_transport_unsupported_reason, resolve_openai_image_auth, GrokHeaderInput,
-    ProviderOpenAiImageHeadersInput, StandardProviderRequestHeadersInput, WINDSURF_ENVELOPE_NAME,
-    GROK_CHAT_PATH,
+    ProviderOpenAiImageHeadersInput, StandardProviderRequestHeadersInput, GROK_CHAT_PATH,
+    WINDSURF_ENVELOPE_NAME,
 };
 use crate::ai_serving::{
     ai_local_execution_contract_for_formats, request_conversion_direct_auth,

@@ -25,10 +25,11 @@ pub use providers::{
     grok_supported_quota_windows_for_tier, normalize_chatgpt_web_image_quota_limit,
     AntigravityProviderPoolAdapter, ChatGptWebProviderPoolAdapter, CodexProviderPoolAdapter,
     DefaultProviderPoolAdapter, GrokProviderPoolAdapter, KiroPoolQuotaAuthInput,
-    KiroProviderPoolAdapter, UnsupportedQuotaProviderPoolAdapter, ANTIGRAVITY_FETCH_AVAILABLE_MODELS_PATH,
-    CHATGPT_WEB_CONVERSATION_INIT_PATH, CHATGPT_WEB_DEFAULT_BASE_URL, CODEX_WHAM_USAGE_URL,
-    KIRO_USAGE_LIMITS_PATH, KIRO_USAGE_SDK_VERSION, WINDSURF_MODEL_CONFIGS_PATH,
-    WINDSURF_RATE_LIMIT_PATH, WINDSURF_USER_STATUS_PATH,
+    KiroProviderPoolAdapter, UnsupportedQuotaProviderPoolAdapter,
+    ANTIGRAVITY_FETCH_AVAILABLE_MODELS_PATH, CHATGPT_WEB_CONVERSATION_INIT_PATH,
+    CHATGPT_WEB_DEFAULT_BASE_URL, CODEX_WHAM_USAGE_URL, KIRO_USAGE_LIMITS_PATH,
+    KIRO_USAGE_SDK_VERSION, WINDSURF_MODEL_CONFIGS_PATH, WINDSURF_RATE_LIMIT_PATH,
+    WINDSURF_USER_STATUS_PATH,
 };
 pub use quota::{
     provider_pool_key_account_quota_exhausted, provider_pool_key_scheduling_label,
@@ -90,7 +91,14 @@ mod tests {
 
         assert_eq!(
             service.provider_types_for_capability(ProviderPoolCapability::QuotaRefresh),
-            ["antigravity", "chatgpt_web", "codex", "grok", "kiro", "windsurf"]
+            [
+                "antigravity",
+                "chatgpt_web",
+                "codex",
+                "grok",
+                "kiro",
+                "windsurf"
+            ]
         );
         assert!(service.supports_quota_refresh("codex"));
         assert!(service.supports_quota_refresh("antigravity"));
@@ -368,7 +376,6 @@ mod tests {
         assert_eq!(
             recent_refresh["providers"],
             json!(["codex", "grok", "kiro", "windsurf"])
-        );
         );
     }
 

@@ -24,13 +24,13 @@ use crate::ai_serving::transport::kiro::{
 use crate::ai_serving::transport::{
     build_grok_browser_headers, build_grok_upstream_url, build_kiro_cross_format_upstream_url,
     build_openai_image_headers, build_openai_image_upstream_url,
-    build_standard_provider_request_headers, openai_image_transport_unsupported_reason,
-    resolve_grok_session_auth, resolve_openai_image_auth, GrokHeaderInput,
-    build_windsurf_cascade_headers, build_windsurf_cascade_request_body,
-    build_windsurf_cascade_upstream_url, is_windsurf_provider_transport,
+    build_standard_provider_request_headers, build_windsurf_cascade_headers,
+    build_windsurf_cascade_request_body, build_windsurf_cascade_upstream_url,
+    is_windsurf_provider_transport,
     local_windsurf_request_transport_unsupported_reason_with_network,
-    ProviderOpenAiImageHeadersInput, StandardProviderRequestHeadersInput, WINDSURF_ENVELOPE_NAME,
-    GROK_CHAT_PATH,
+    openai_image_transport_unsupported_reason, resolve_grok_session_auth,
+    resolve_openai_image_auth, GrokHeaderInput, ProviderOpenAiImageHeadersInput,
+    StandardProviderRequestHeadersInput, GROK_CHAT_PATH, WINDSURF_ENVELOPE_NAME,
 };
 use crate::ai_serving::{
     build_openai_image_request_body_from_gemini_image_request, gemini_request_is_image_generation,

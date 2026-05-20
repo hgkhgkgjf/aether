@@ -176,11 +176,7 @@ fn extract_admin_provider_oauth_batch_import_entry(
                     .get("access_token")
                     .or_else(|| object.get("accessToken")),
             );
-            let grok_token_alias = if is_grok {
-                object.get("token")
-            } else {
-                None
-            };
+            let grok_token_alias = if is_grok { object.get("token") } else { None };
             let grok_cookie = if is_grok {
                 coerce_admin_provider_oauth_import_str(
                     object.get("cookie").or_else(|| object.get("cookieHeader")),
@@ -204,26 +200,30 @@ fn extract_admin_provider_oauth_batch_import_entry(
                 refresh_token.as_deref(),
                 access_token.as_deref().or(session_token.as_deref()),
             );
-            let windsurf_api_key = is_windsurf.then(|| {
-                coerce_admin_provider_oauth_import_str(
-                object.get("api_key").or_else(|| object.get("apiKey")),
-                )
-            }).flatten();
-            let windsurf_token = is_windsurf.then(|| {
-                coerce_admin_provider_oauth_import_str(
-                    object
-                        .get("token")
-                        .or_else(|| object.get("auth_token"))
-                        .or_else(|| object.get("authToken")),
-                )
-            }).flatten();
+            let windsurf_api_key = is_windsurf
+                .then(|| {
+                    coerce_admin_provider_oauth_import_str(
+                        object.get("api_key").or_else(|| object.get("apiKey")),
+                    )
+                })
+                .flatten();
+            let windsurf_token = is_windsurf
+                .then(|| {
+                    coerce_admin_provider_oauth_import_str(
+                        object
+                            .get("token")
+                            .or_else(|| object.get("auth_token"))
+                            .or_else(|| object.get("authToken")),
+                    )
+                })
+                .flatten();
             let windsurf_password = is_windsurf
                 .then(|| coerce_admin_provider_oauth_import_str(object.get("password")))
                 .flatten();
             let raw_credentials = if is_windsurf
                 && (windsurf_api_key.is_some()
-                || windsurf_token.is_some()
-                || windsurf_password.is_some())
+                    || windsurf_token.is_some()
+                    || windsurf_password.is_some())
             {
                 Some(item.clone())
             } else {

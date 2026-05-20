@@ -28,9 +28,9 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, warn};
 
 use crate::ai_serving::api::{
-    build_core_error_body_for_client_format, implicit_sync_finalize_report_kind,
-    maybe_build_sync_finalize_outcome, extract_provider_private_stream_error_body,
-    LocalCoreSyncErrorKind, LocalCoreSyncFinalizeOutcome,
+    build_core_error_body_for_client_format, extract_provider_private_stream_error_body,
+    implicit_sync_finalize_report_kind, maybe_build_sync_finalize_outcome, LocalCoreSyncErrorKind,
+    LocalCoreSyncFinalizeOutcome,
 };
 use crate::api::response::{
     attach_control_metadata_headers, build_client_response, build_client_response_from_parts,
@@ -47,10 +47,10 @@ use crate::execution_runtime::submission::{
     resolve_local_sync_error_status_code, submit_local_core_error_or_sync_finalize,
 };
 use crate::execution_runtime::transport::{
-    build_execution_response_body,
-    build_request_body, collect_response_headers, decode_response_body_bytes,
-    format_upstream_request_error, format_wreq_upstream_request_error, response_body_is_json,
-    send_request, DirectHttpResponse, DirectSyncExecutionRuntime, ExecutionRuntimeTransportError,
+    build_execution_response_body, build_request_body, collect_response_headers,
+    decode_response_body_bytes, format_upstream_request_error, format_wreq_upstream_request_error,
+    response_body_is_json, send_request, DirectHttpResponse, DirectSyncExecutionRuntime,
+    ExecutionRuntimeTransportError,
 };
 use crate::execution_runtime::windsurf::maybe_execute_windsurf_sync;
 use crate::execution_runtime::{
