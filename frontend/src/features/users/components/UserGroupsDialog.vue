@@ -363,15 +363,18 @@ async function loadDialogData(): Promise<void> {
 
 async function ensureDialogUsers(): Promise<void> {
   const now = Date.now()
+  const isSameUserVersion = dialogUsersLoadedVersion === props.usersVersion
   if (
-    dialogUsersLoadedVersion === props.usersVersion
+    isSameUserVersion
     && dialogUsersLoadedAt > 0
     && now - dialogUsersLoadedAt < USER_OPTIONS_CACHE_TTL_MS
   ) {
     return
   }
 
-  dialogUsers.value = await usersStore.listAllUsers({ cacheTtlMs: USER_OPTIONS_CACHE_TTL_MS })
+  dialogUsers.value = await usersStore.listAllUsers({
+    cacheTtlMs: isSameUserVersion ? USER_OPTIONS_CACHE_TTL_MS : 0,
+  })
   dialogUsersLoadedAt = Date.now()
   dialogUsersLoadedVersion = props.usersVersion
 }
