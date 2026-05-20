@@ -14,7 +14,8 @@ use crate::formats::openai::chat::stream::{
 };
 use crate::formats::shared::sse::{encode_done_sse, encode_json_sse};
 use crate::formats::shared::stream_core::common::{
-    build_openai_chat_chunk, build_openai_chat_finish_chunk, build_openai_chat_usage_chunk,
+    build_openai_chat_chunk, build_openai_chat_finish_chunk,
+    build_openai_chat_usage_chunk_with_cache,
 };
 use crate::formats::shared::stream_core::{
     CanonicalStreamFrame, StreamingStandardFormatMatrix, StreamingStandardTerminalObserver,
@@ -171,20 +172,29 @@ fn maybe_bridge_openai_image_sync_json_to_chat_stream(
         None,
         &build_openai_chat_finish_chunk(&response_id, &model, Some("stop")),
     )?);
-    if let Some((input_tokens, output_tokens, total_tokens, reasoning_tokens)) = summary
+    if let Some((
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        reasoning_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+    )) = summary
         .standardized_usage
         .as_ref()
         .and_then(openai_chat_usage_counts)
     {
         sse_body.extend(encode_json_sse(
             None,
-            &build_openai_chat_usage_chunk(
+            &build_openai_chat_usage_chunk_with_cache(
                 &response_id,
                 &model,
                 input_tokens,
                 output_tokens,
                 total_tokens,
                 reasoning_tokens,
+                cache_creation_tokens,
+                cache_read_tokens,
             ),
         )?);
     }
@@ -489,10 +499,12 @@ fn openai_image_standardized_usage(
     (standardized_usage.signal_score() > 0).then_some(standardized_usage)
 }
 
-fn openai_chat_usage_counts(usage: &StandardizedUsage) -> Option<(u64, u64, u64, u64)> {
+fn openai_chat_usage_counts(usage: &StandardizedUsage) -> Option<(u64, u64, u64, u64, u64, u64)> {
     let input_tokens = usage.input_tokens.max(0) as u64;
     let output_tokens = usage.output_tokens.max(0) as u64;
     let reasoning_tokens = usage.reasoning_tokens.max(0) as u64;
+    let cache_creation_tokens = usage.cache_creation_tokens.max(0) as u64;
+    let cache_read_tokens = usage.cache_read_tokens.max(0) as u64;
     let total_tokens = usage
         .dimensions
         .get("total_tokens")
@@ -502,7 +514,14 @@ fn openai_chat_usage_counts(usage: &StandardizedUsage) -> Option<(u64, u64, u64,
                 .saturating_add(output_tokens)
                 .saturating_add(reasoning_tokens)
         });
-    (total_tokens > 0).then_some((input_tokens, output_tokens, total_tokens, reasoning_tokens))
+    (total_tokens > 0).then_some((
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        reasoning_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+    ))
 }
 
 fn openai_image_bridge_response_id(
@@ -1207,7 +1226,11 @@ mod tests {
                 "usage": {
                     "total_tokens": 100,
                     "input_tokens": 50,
-                    "output_tokens": 50
+                    "output_tokens": 50,
+                    "input_tokens_details": {
+                        "cached_tokens": 20,
+                        "cached_creation_tokens": 10
+                    }
                 }
             }),
             "openai:image",
@@ -1222,6 +1245,8 @@ mod tests {
         assert!(output.contains("![generated image](data:image/png;base64,aGVsbG8=)"));
         assert!(output.contains("![generated image 2](data:image/png;base64,d29ybGQ=)"));
         assert!(output.contains("\"finish_reason\":\"stop\""));
+        assert!(output.contains("\"cached_tokens\":20"));
+        assert!(output.contains("\"cached_creation_tokens\":10"));
         assert!(output.contains("data: [DONE]"));
         assert!(!output.contains("image_generation.completed"));
 

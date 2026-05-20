@@ -8,7 +8,8 @@ use crate::contracts::OPENAI_IMAGE_SYNC_FINALIZE_REPORT_KIND;
 use crate::formats::openai::responses::codex::CODEX_OPENAI_IMAGE_DEFAULT_OUTPUT_FORMAT;
 use crate::formats::shared::sse::{encode_done_sse, encode_json_sse};
 use crate::formats::shared::stream_core::common::{
-    build_openai_chat_chunk, build_openai_chat_finish_chunk, build_openai_chat_usage_chunk,
+    build_openai_chat_chunk, build_openai_chat_finish_chunk,
+    build_openai_chat_usage_chunk_with_cache,
 };
 use crate::formats::shared::AiSurfaceFinalizeError;
 
@@ -501,18 +502,26 @@ impl OpenAiImageChatStreamState {
             None,
             &build_openai_chat_finish_chunk(&response_id, &model, Some("stop")),
         )?);
-        if let Some((input_tokens, output_tokens, total_tokens, reasoning_tokens)) =
-            openai_image_chat_usage_counts(usage)
+        if let Some((
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            reasoning_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
+        )) = openai_image_chat_usage_counts(usage)
         {
             output.extend(encode_json_sse(
                 None,
-                &build_openai_chat_usage_chunk(
+                &build_openai_chat_usage_chunk_with_cache(
                     &response_id,
                     &model,
                     input_tokens,
                     output_tokens,
                     total_tokens,
                     reasoning_tokens,
+                    cache_creation_tokens,
+                    cache_read_tokens,
                 ),
             )?);
         }
@@ -900,7 +909,7 @@ fn image_chat_markdown(frame: &OpenAiImageChatFrame) -> String {
     )
 }
 
-fn openai_image_chat_usage_counts(usage: Option<&Value>) -> Option<(u64, u64, u64, u64)> {
+fn openai_image_chat_usage_counts(usage: Option<&Value>) -> Option<(u64, u64, u64, u64, u64, u64)> {
     let usage = usage.and_then(Value::as_object)?;
     let mut input_tokens = usage
         .get("input_tokens")
@@ -912,6 +921,30 @@ fn openai_image_chat_usage_counts(usage: Option<&Value>) -> Option<(u64, u64, u6
         .or_else(|| usage.get("completion_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let cache_creation_tokens = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            usage
+                .get("input_tokens_details")
+                .or_else(|| usage.get("prompt_tokens_details"))
+                .and_then(Value::as_object)
+                .and_then(|details| details.get("cached_creation_tokens"))
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(0);
+    let cache_read_tokens = usage
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            usage
+                .get("input_tokens_details")
+                .or_else(|| usage.get("prompt_tokens_details"))
+                .and_then(Value::as_object)
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(0);
     let total_tokens = usage
         .get("total_tokens")
         .and_then(Value::as_u64)
@@ -919,7 +952,14 @@ fn openai_image_chat_usage_counts(usage: Option<&Value>) -> Option<(u64, u64, u6
     if input_tokens == 0 && total_tokens > output_tokens {
         input_tokens = total_tokens.saturating_sub(output_tokens);
     }
-    (total_tokens > 0).then_some((input_tokens, output_tokens, total_tokens, 0))
+    (total_tokens > 0).then_some((
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        0,
+        cache_creation_tokens,
+        cache_read_tokens,
+    ))
 }
 
 fn image_failure_error(event: &Value) -> Value {
