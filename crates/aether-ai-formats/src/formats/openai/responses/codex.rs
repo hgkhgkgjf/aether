@@ -375,6 +375,51 @@ fn ensure_codex_chat_reasoning_defaults(
         .or_insert_with(|| json!(CODEX_DEFAULT_REASONING_SUMMARY));
 }
 
+fn codex_tool_type_rejects_top_level_name(tool_type: &str) -> bool {
+    let normalized = tool_type.trim().to_ascii_lowercase();
+    !normalized.is_empty()
+        && normalized != "function"
+        && normalized != "custom"
+        && normalized != "namespace"
+}
+
+fn strip_codex_hosted_tool_names_for_backend(body_object: &mut serde_json::Map<String, Value>) {
+    let Some(tools) = body_object.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    for tool in tools {
+        let Some(tool_object) = tool.as_object_mut() else {
+            continue;
+        };
+        if tool_object
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(codex_tool_type_rejects_top_level_name)
+        {
+            tool_object.remove("name");
+        }
+    }
+}
+
+fn strip_codex_hosted_tool_choice_name_for_backend(
+    body_object: &mut serde_json::Map<String, Value>,
+) {
+    let Some(tool_choice_object) = body_object
+        .get_mut("tool_choice")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    if tool_choice_object
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(codex_tool_type_rejects_top_level_name)
+    {
+        tool_choice_object.remove("name");
+    }
+}
+
 pub fn apply_codex_openai_responses_special_body_edits(
     provider_request_body: &mut Value,
     provider_type: &str,
@@ -420,6 +465,8 @@ pub fn apply_codex_openai_responses_special_body_edits(
     {
         body_object.insert("instructions".to_string(), json!(""));
     }
+    strip_codex_hosted_tool_names_for_backend(body_object);
+    strip_codex_hosted_tool_choice_name_for_backend(body_object);
     if is_openai_image_request(provider_api_format)
         || codex_openai_responses_tool_choice_references_image_generation(body_object)
     {
@@ -618,6 +665,87 @@ mod tests {
             ])
         );
         assert_eq!(provider_request_body["parallel_tool_calls"], json!(false));
+    }
+
+    #[test]
+    fn codex_responses_body_edits_preserve_function_tools_for_codex_backend() {
+        let mut provider_request_body = json!({
+            "input": [],
+            "model": "gpt-5.4",
+            "tools": [{
+                "type": "function",
+                "name": "lookup_account",
+                "description": "Lookup an account by id.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "account_id": {
+                            "type": "string"
+                        }
+                    },
+                    "required": ["account_id"],
+                    "additionalProperties": false
+                },
+                "strict": true
+            }],
+            "tool_choice": {
+                "type": "function",
+                "name": "lookup_account"
+            }
+        });
+
+        apply_codex_openai_responses_special_body_edits(
+            &mut provider_request_body,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+
+        assert_eq!(
+            provider_request_body["tools"][0]["name"],
+            json!("lookup_account")
+        );
+        assert_eq!(
+            provider_request_body["tools"][0]["parameters"]["properties"]["account_id"]["type"],
+            json!("string")
+        );
+        assert_eq!(
+            provider_request_body["tool_choice"]["name"],
+            json!("lookup_account")
+        );
+        assert!(provider_request_body["tools"][0].get("function").is_none());
+    }
+
+    #[test]
+    fn codex_responses_body_edits_strip_name_from_hosted_web_search_tool() {
+        let mut provider_request_body = json!({
+            "input": [],
+            "model": "gpt-5.4",
+            "tools": [{
+                "type": "web_search",
+                "name": "web_search"
+            }],
+            "tool_choice": {
+                "type": "web_search",
+                "name": "web_search"
+            }
+        });
+
+        apply_codex_openai_responses_special_body_edits(
+            &mut provider_request_body,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+
+        assert!(provider_request_body["tools"][0].get("name").is_none());
+        assert!(provider_request_body["tool_choice"].get("name").is_none());
+        assert_eq!(
+            provider_request_body["tool_choice"]["type"],
+            json!("web_search")
+        );
     }
 
     #[test]
