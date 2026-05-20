@@ -4378,7 +4378,7 @@ async fn gateway_handles_wallet_balance_locally_without_proxying_upstream() {
 #[tokio::test]
 async fn gateway_handles_wallet_today_cost_locally_without_proxying_upstream() {
     let auth_now = Utc::now();
-    let usage_now = auth_now - chrono::Duration::minutes(30);
+    let usage_now = auth_now;
     let user = sample_auth_user(auth_now);
     let access_token = build_test_auth_token(
         "access",

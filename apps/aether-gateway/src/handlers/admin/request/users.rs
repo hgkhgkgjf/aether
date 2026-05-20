@@ -42,6 +42,13 @@ impl<'a> AdminAppState<'a> {
         self.app.list_export_users_page(query).await
     }
 
+    pub(crate) async fn count_export_users(
+        &self,
+        query: &aether_data::repository::users::UserExportListQuery,
+    ) -> Result<u64, GatewayError> {
+        self.app.count_export_users(query).await
+    }
+
     pub(crate) async fn find_export_user_by_id(
         &self,
         user_id: &str,

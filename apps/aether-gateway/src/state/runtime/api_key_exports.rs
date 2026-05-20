@@ -169,6 +169,16 @@ impl AppState {
             .map_err(|err| GatewayError::Internal(err.to_string()))
     }
 
+    pub(crate) async fn count_export_users(
+        &self,
+        query: &aether_data::repository::users::UserExportListQuery,
+    ) -> Result<u64, GatewayError> {
+        self.data
+            .count_export_users(query)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))
+    }
+
     pub(crate) async fn find_export_user_by_id(
         &self,
         user_id: &str,

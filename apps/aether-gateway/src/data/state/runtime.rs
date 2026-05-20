@@ -1512,6 +1512,16 @@ impl GatewayDataState {
         }
     }
 
+    pub(crate) async fn count_export_users(
+        &self,
+        query: &aether_data::repository::users::UserExportListQuery,
+    ) -> Result<u64, DataLayerError> {
+        match &self.user_reader {
+            Some(repository) => repository.count_export_users(query).await,
+            None => Ok(0),
+        }
+    }
+
     pub(crate) async fn summarize_export_users(
         &self,
     ) -> Result<aether_data::repository::users::UserExportSummary, DataLayerError> {

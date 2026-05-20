@@ -310,6 +310,7 @@ fn empty_database_snapshot_covers_current_cutoff_versions() {
             20260519000000,
             20260519120000,
             20260519130000,
+            20260520000000,
         ]
     );
 }
@@ -470,6 +471,30 @@ fn management_tokens_json_columns_are_normalized_to_jsonb_in_postgres_schema_pat
 }
 
 #[test]
+fn api_key_ip_rules_is_jsonb_in_postgres_schema_paths() {
+    let api_key_ip_rules_migration = POSTGRES_MIGRATOR
+        .iter()
+        .find(|migration| migration.version == 20260520000000)
+        .expect("api key IP rules migration should be embedded");
+    assert!(api_key_ip_rules_migration
+        .sql
+        .contains("ADD COLUMN IF NOT EXISTS ip_rules jsonb NULL"));
+    assert!(api_key_ip_rules_migration
+        .sql
+        .contains("ALTER COLUMN ip_rules TYPE jsonb USING ip_rules::jsonb"));
+
+    assert!(EMPTY_DATABASE_SNAPSHOT_SQL.contains("ip_rules jsonb,"));
+
+    let bootstrap_schema =
+        include_str!("../../../schema/bootstrap/postgres/001_types_and_tables.sql");
+    assert!(bootstrap_schema.contains("ip_rules jsonb,"));
+
+    let generated_identity =
+        include_str!("../../../schema/generated/postgres/baseline/001_identity.sql");
+    assert!(generated_identity.contains("ip_rules jsonb,"));
+}
+
+#[test]
 fn provider_api_keys_api_key_is_nullable() {
     let baseline_migration = POSTGRES_MIGRATOR
         .iter()
@@ -605,6 +630,7 @@ fn mysql_and_sqlite_migrations_include_enabled_incrementals() {
             20260519000000,
             20260519120000,
             20260519130000,
+            20260520000000,
         ]
     );
     assert_eq!(
@@ -626,6 +652,7 @@ fn mysql_and_sqlite_migrations_include_enabled_incrementals() {
             20260519000000,
             20260519120000,
             20260519130000,
+            20260520000000,
         ]
     );
 }
@@ -1147,6 +1174,7 @@ fn pending_migrations_from_applied_skips_versions_already_applied() {
             20260519000000,
             20260519120000,
             20260519130000,
+            20260520000000,
         ]
     );
 }
