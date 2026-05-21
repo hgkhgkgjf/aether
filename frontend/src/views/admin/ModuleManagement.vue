@@ -275,6 +275,7 @@ const moduleOrder = ref<string[]>([])
 const orderSaving = ref(false)
 const draggedModuleName = ref<string | null>(null)
 const dragOverModuleName = ref<string | null>(null)
+const BUILTIN_BACKING_MODULES = new Set(['important_notification'])
 
 // 过滤后的内置工具
 const filteredBuiltinTools = computed(() => {
@@ -351,7 +352,9 @@ function moveNameToTargetIndex(names: string[], draggedName: string, targetName:
 
 // 后端默认顺序
 const defaultOrderedModules = computed(() => {
-  return Object.values(moduleStore.modules).sort(compareModuleDefaultOrder)
+  return Object.values(moduleStore.modules)
+    .filter(module => !BUILTIN_BACKING_MODULES.has(module.name))
+    .sort(compareModuleDefaultOrder)
 })
 
 // 所有模块列表（应用自定义展示顺序）

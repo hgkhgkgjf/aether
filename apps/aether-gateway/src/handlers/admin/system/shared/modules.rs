@@ -4,6 +4,7 @@ use crate::important_notification::{
     important_notification_configured, IMPORTANT_NOTIFICATION_ENABLED_KEY,
     LEGACY_NOTIFICATION_EMAIL_ENABLED_KEY,
 };
+use crate::server_chan_push::server_chan_push_configured;
 use crate::system_features::ENABLE_MODEL_DIRECTIVES_CONFIG_KEY;
 use crate::GatewayError;
 use aether_admin::system as admin_system_kernel;
@@ -73,15 +74,27 @@ pub(crate) const ADMIN_MODULE_DEFINITIONS: &[AdminModuleDefinition] = &[
     },
     AdminModuleDefinition {
         name: "important_notification",
-        display_name: "重要通知",
-        description: "统一发送邮件和 Server 酱重要通知，供额度提醒等后台任务使用",
+        display_name: "通知服务",
+        description: "统一管理通知项、模板和推送服务选择，供后台任务和用户通知使用",
         category: "integration",
         env_key: "IMPORTANT_NOTIFICATION_AVAILABLE",
         default_available: true,
-        admin_route: Some("/admin/modules/important-notification"),
+        admin_route: Some("/admin/notification-service"),
         admin_menu_icon: Some("BellRing"),
-        admin_menu_group: Some("system"),
+        admin_menu_group: None,
         admin_menu_order: 58,
+    },
+    AdminModuleDefinition {
+        name: "server_chan_push",
+        display_name: "Server 酱推送",
+        description: "第三方推送服务，配置 Server 酱 Turbo SendKey 并测试微信推送",
+        category: "integration",
+        env_key: "SERVER_CHAN_PUSH_AVAILABLE",
+        default_available: true,
+        admin_route: Some("/admin/modules/server-chan"),
+        admin_menu_icon: Some("Send"),
+        admin_menu_group: Some("system"),
+        admin_menu_order: 59,
     },
     AdminModuleDefinition {
         name: "model_directives",
@@ -155,6 +168,7 @@ pub(crate) struct AdminModuleRuntimeState {
     ldap_config: Option<aether_data::repository::auth_modules::StoredLdapModuleConfig>,
     gemini_files_has_capable_key: bool,
     important_notification_configured: bool,
+    server_chan_push_configured: bool,
 }
 
 pub(crate) fn admin_module_by_name(name: &str) -> Option<&'static AdminModuleDefinition> {
@@ -242,12 +256,14 @@ pub(crate) async fn build_admin_module_runtime_state(
     };
 
     let notification_configured = important_notification_configured(state.app()).await?;
+    let server_chan_configured = server_chan_push_configured(state.app()).await?;
 
     Ok(AdminModuleRuntimeState {
         oauth_providers,
         ldap_config,
         gemini_files_has_capable_key,
         important_notification_configured: notification_configured,
+        server_chan_push_configured: server_chan_configured,
     })
 }
 
@@ -261,6 +277,7 @@ pub(crate) fn build_admin_module_validation_result(
         runtime.ldap_config.as_ref(),
         runtime.gemini_files_has_capable_key,
         runtime.important_notification_configured,
+        runtime.server_chan_push_configured,
     )
 }
 

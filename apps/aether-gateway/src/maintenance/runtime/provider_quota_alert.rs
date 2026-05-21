@@ -12,7 +12,8 @@ use crate::admin_api::{
     admin_provider_ops_local_action_response, store_admin_provider_ops_balance_cache, AdminAppState,
 };
 use crate::important_notification::{
-    important_notification_dispatch_ready, send_important_notification, ImportantNotification,
+    important_notification_dispatch_ready_for_item, send_important_notification_for_item,
+    ImportantNotification, PROVIDER_QUOTA_ALERT_ITEM_KEY,
 };
 use crate::{AppState, GatewayError};
 
@@ -75,7 +76,8 @@ pub(crate) async fn perform_provider_quota_alert_once(
             failed: 0,
         });
     }
-    if !important_notification_dispatch_ready(state).await? {
+    if !important_notification_dispatch_ready_for_item(state, PROVIDER_QUOTA_ALERT_ITEM_KEY).await?
+    {
         return Ok(ProviderQuotaAlertRunSummary {
             checked: 0,
             alerted: 0,
@@ -223,13 +225,21 @@ async fn run_provider_quota_alert_for_provider(
     };
 
     if should_notify {
-        let report = send_important_notification(
+        let notification = build_provider_quota_alert_notification(
+            &target.provider,
+            total_available,
+            target.config.threshold_amount,
+        );
+        let variables = provider_quota_alert_notification_variables(
+            &target.provider,
+            total_available,
+            target.config.threshold_amount,
+        );
+        let report = send_important_notification_for_item(
             state,
-            build_provider_quota_alert_notification(
-                &target.provider,
-                total_available,
-                target.config.threshold_amount,
-            ),
+            PROVIDER_QUOTA_ALERT_ITEM_KEY,
+            notification,
+            &variables,
         )
         .await;
         let delivered = match &report {
@@ -355,6 +365,19 @@ fn build_provider_quota_alert_notification(
         markdown_body: body,
         text_body,
     }
+}
+
+fn provider_quota_alert_notification_variables(
+    provider: &StoredProviderCatalogProvider,
+    total_available: f64,
+    threshold_amount: f64,
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("provider_name", provider.name.clone()),
+        ("provider_id", provider.id.clone()),
+        ("total_available", format!("{total_available:.4}")),
+        ("threshold_amount", format!("{threshold_amount:.4}")),
+    ]
 }
 
 async fn read_quota_alert_runtime_state(

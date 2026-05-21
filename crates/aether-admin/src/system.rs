@@ -174,6 +174,44 @@ fn chat_pii_redaction_default_rules() -> serde_json::Value {
     ])
 }
 
+fn notification_service_default_items() -> serde_json::Value {
+    json!([
+        {
+            "key": "provider_quota_alert",
+            "name": "号池额度不足",
+            "enabled": true,
+            "channel": "global",
+            "title_template": "",
+            "markdown_template": "",
+            "text_template": "",
+            "user_email_enabled": false,
+            "system": true
+        },
+        {
+            "key": "provider_pool_abnormal",
+            "name": "号池异常",
+            "enabled": true,
+            "channel": "global",
+            "title_template": "号池异常：{provider_name}",
+            "markdown_template": "号池 `{provider_name}` 出现异常，请检查服务状态。",
+            "text_template": "号池 {provider_name} 出现异常，请检查服务状态。",
+            "user_email_enabled": false,
+            "system": true
+        },
+        {
+            "key": "user_balance_low",
+            "name": "用户余额不足",
+            "enabled": true,
+            "channel": "email",
+            "title_template": "余额不足提醒",
+            "markdown_template": "你的账户余额已低于提醒阈值，请及时处理。",
+            "text_template": "你的账户余额已低于提醒阈值，请及时处理。",
+            "user_email_enabled": true,
+            "system": true
+        }
+    ])
+}
+
 fn normalize_chat_pii_redaction_placeholder_prefix(raw: &str) -> Option<String> {
     let value = raw.trim();
     if value.is_empty() || value.len() > 32 {
@@ -670,6 +708,7 @@ const LEGACY_REQUEST_LOG_LEVEL_KEY: &str = "request_log_level";
 const SENSITIVE_SYSTEM_CONFIG_KEYS: &[&str] = &[
     "smtp_password",
     "turnstile_secret_key",
+    "module.server_chan_push.send_key",
     "module.important_notification.server_chan_send_key",
 ];
 const ADMIN_API_FORMAT_DEFINITIONS: &[AdminApiFormatDefinition] = &[
@@ -1167,6 +1206,7 @@ pub fn build_admin_module_validation_result(
     ldap_config: Option<&StoredLdapModuleConfig>,
     gemini_files_has_capable_key: bool,
     important_notification_configured: bool,
+    server_chan_push_configured: bool,
 ) -> (bool, Option<String>) {
     match module_name {
         "oauth" => {
@@ -1241,7 +1281,14 @@ pub fn build_admin_module_validation_result(
             if important_notification_configured {
                 (true, None)
             } else {
-                (false, Some("请先完成重要通知通道配置".to_string()))
+                (false, Some("请先完成通知服务推送渠道配置".to_string()))
+            }
+        }
+        "server_chan_push" => {
+            if server_chan_push_configured {
+                (true, None)
+            } else {
+                (false, Some("请先配置 Server 酱 SendKey".to_string()))
             }
         }
         "gemini_files" => {
@@ -1264,9 +1311,11 @@ pub fn build_admin_module_health(
     gemini_files_has_capable_key: bool,
 ) -> &'static str {
     match module_name {
-        "management_tokens" | "model_directives" | "proxy_nodes" | "important_notification" => {
-            "healthy"
-        }
+        "management_tokens"
+        | "model_directives"
+        | "proxy_nodes"
+        | "important_notification"
+        | "server_chan_push" => "healthy",
         "gemini_files" => {
             if gemini_files_has_capable_key {
                 "healthy"
@@ -1445,6 +1494,12 @@ pub fn normalize_admin_system_config_key(requested_key: &str) -> String {
         REQUEST_RECORD_LEVEL_KEY.to_string()
     } else if trimmed.eq_ignore_ascii_case("module.notification_email.enabled") {
         "module.important_notification.enabled".to_string()
+    } else if trimmed.eq_ignore_ascii_case("module.important_notification.server_chan_enabled") {
+        "module.server_chan_push.enabled".to_string()
+    } else if trimmed.eq_ignore_ascii_case("module.important_notification.server_chan_send_key") {
+        "module.server_chan_push.send_key".to_string()
+    } else if trimmed.eq_ignore_ascii_case("module.important_notification.server_chan_template") {
+        "module.server_chan_push.template".to_string()
     } else {
         trimmed.to_string()
     }
@@ -1461,6 +1516,21 @@ pub fn admin_system_config_delete_keys(requested_key: &str) -> Vec<String> {
         vec![
             "module.important_notification.enabled".to_string(),
             "module.notification_email.enabled".to_string(),
+        ]
+    } else if normalized == "module.server_chan_push.enabled" {
+        vec![
+            "module.server_chan_push.enabled".to_string(),
+            "module.important_notification.server_chan_enabled".to_string(),
+        ]
+    } else if normalized == "module.server_chan_push.send_key" {
+        vec![
+            "module.server_chan_push.send_key".to_string(),
+            "module.important_notification.server_chan_send_key".to_string(),
+        ]
+    } else if normalized == "module.server_chan_push.template" {
+        vec![
+            "module.server_chan_push.template".to_string(),
+            "module.important_notification.server_chan_template".to_string(),
         ]
     } else {
         vec![normalized]
@@ -1586,9 +1656,11 @@ pub fn admin_system_config_default_value(key: &str) -> Option<serde_json::Value>
         "module.important_notification.enabled" => Some(json!(false)),
         "module.important_notification.email_enabled" => Some(json!(false)),
         "module.important_notification.email_recipients" => Some(json!("")),
-        "module.important_notification.server_chan_enabled" => Some(json!(false)),
-        "module.important_notification.server_chan_send_key" => Some(serde_json::Value::Null),
-        "module.important_notification.server_chan_template" => Some(json!("")),
+        "module.important_notification.default_channel" => Some(json!("all")),
+        "module.important_notification.items" => Some(notification_service_default_items()),
+        "module.server_chan_push.enabled" => Some(json!(false)),
+        "module.server_chan_push.send_key" => Some(serde_json::Value::Null),
+        "module.server_chan_push.template" => Some(json!("")),
         "module.chat_pii_redaction.enabled" => Some(json!(false)),
         "module.chat_pii_redaction.rules" => Some(chat_pii_redaction_default_rules()),
         "module.chat_pii_redaction.cache_ttl_seconds" => Some(json!(300)),
@@ -1777,6 +1849,125 @@ fn normalize_nullable_string_config_value(
     }
 }
 
+fn normalize_notification_channel_value(value: serde_json::Value) -> Result<serde_json::Value, ()> {
+    match value {
+        Value::Null => Ok(json!("all")),
+        Value::String(raw) => {
+            let normalized = normalize_notification_channel(raw.trim(), false)?;
+            Ok(json!(normalized))
+        }
+        _ => Err(()),
+    }
+}
+
+fn normalize_notification_channel(raw: &str, allow_global: bool) -> Result<&'static str, ()> {
+    match raw.to_ascii_lowercase().as_str() {
+        "all" => Ok("all"),
+        "email" => Ok("email"),
+        "server_chan" | "serverchan" | "serve_chan" => Ok("server_chan"),
+        "global" | "" if allow_global => Ok("global"),
+        _ => Err(()),
+    }
+}
+
+fn normalize_notification_service_items_value(
+    value: serde_json::Value,
+) -> Result<serde_json::Value, ()> {
+    let Value::Array(items) = value else {
+        return Err(());
+    };
+    let mut normalized_items = Vec::with_capacity(items.len());
+    let mut keys = BTreeSet::new();
+    for item in items {
+        let Value::Object(raw_item) = item else {
+            return Err(());
+        };
+        let key = normalize_notification_item_key(raw_item.get("key"))?;
+        if !keys.insert(key.clone()) {
+            return Err(());
+        }
+        let name = normalize_optional_bounded_string(raw_item.get("name"), 80)?
+            .unwrap_or_else(|| key.clone());
+        let enabled = raw_item
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let channel = raw_item
+            .get("channel")
+            .and_then(Value::as_str)
+            .map(|raw| normalize_notification_channel(raw.trim(), true))
+            .transpose()?
+            .unwrap_or("global");
+        let title_template =
+            normalize_optional_bounded_string(raw_item.get("title_template"), 256)?
+                .unwrap_or_default();
+        let markdown_template =
+            normalize_optional_bounded_string(raw_item.get("markdown_template"), 8_000)?
+                .unwrap_or_default();
+        let text_template =
+            normalize_optional_bounded_string(raw_item.get("text_template"), 8_000)?
+                .unwrap_or_default();
+        let user_email_enabled = raw_item
+            .get("user_email_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let system = raw_item
+            .get("system")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        normalized_items.push(json!({
+            "key": key,
+            "name": name,
+            "enabled": enabled,
+            "channel": channel,
+            "title_template": title_template,
+            "markdown_template": markdown_template,
+            "text_template": text_template,
+            "user_email_enabled": user_email_enabled,
+            "system": system,
+        }));
+    }
+    Ok(Value::Array(normalized_items))
+}
+
+fn normalize_notification_item_key(value: Option<&Value>) -> Result<String, ()> {
+    let Some(raw) = value.and_then(Value::as_str).map(str::trim) else {
+        return Err(());
+    };
+    if raw.is_empty() || raw.len() > 64 {
+        return Err(());
+    }
+    if !raw
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
+    {
+        return Err(());
+    }
+    Ok(raw.to_string())
+}
+
+fn normalize_optional_bounded_string(
+    value: Option<&Value>,
+    max_len: usize,
+) -> Result<Option<String>, ()> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(raw)) => {
+            let trimmed = raw.trim();
+            if trimmed.len() > max_len {
+                return Err(());
+            }
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+        Some(_) => Err(()),
+    }
+}
+
 pub fn parse_admin_system_config_update(
     requested_key: &str,
     request_body: &[u8],
@@ -1832,7 +2023,7 @@ pub fn parse_admin_system_config_update(
     match normalized_key.as_str() {
         "module.important_notification.enabled"
         | "module.important_notification.email_enabled"
-        | "module.important_notification.server_chan_enabled" => match value.as_bool() {
+        | "module.server_chan_push.enabled" => match value.as_bool() {
             Some(enabled) => value = json!(enabled),
             None if value.is_null() => {
                 value = admin_system_config_default_value(&normalized_key).unwrap_or(json!(false));
@@ -1852,7 +2043,27 @@ pub fn parse_admin_system_config_update(
                 )
             })?;
         }
-        "module.important_notification.server_chan_send_key" => {
+        "module.important_notification.default_channel" => {
+            value = normalize_notification_channel_value(value).map_err(|_| {
+                (
+                    http::StatusCode::BAD_REQUEST,
+                    json!({ "detail": "请求数据验证失败" }),
+                )
+            })?;
+        }
+        "module.important_notification.items" => {
+            if value.is_null() {
+                value = notification_service_default_items();
+            } else {
+                value = normalize_notification_service_items_value(value).map_err(|_| {
+                    (
+                        http::StatusCode::BAD_REQUEST,
+                        json!({ "detail": "请求数据验证失败" }),
+                    )
+                })?;
+            }
+        }
+        "module.server_chan_push.send_key" => {
             value = normalize_nullable_string_config_value(value).map_err(|_| {
                 (
                     http::StatusCode::BAD_REQUEST,
@@ -1860,7 +2071,7 @@ pub fn parse_admin_system_config_update(
                 )
             })?;
         }
-        "module.important_notification.server_chan_template" => {
+        "module.server_chan_push.template" => {
             value = match value {
                 Value::Null => json!(""),
                 Value::String(raw) => json!(raw),
@@ -2929,6 +3140,9 @@ mod tests {
         assert!(is_sensitive_admin_system_config_key("turnstile_secret_key"));
         assert!(is_sensitive_admin_system_config_key("TURNSTILE_SECRET_KEY"));
         assert!(is_sensitive_admin_system_config_key(
+            "module.server_chan_push.send_key"
+        ));
+        assert!(is_sensitive_admin_system_config_key(
             "module.important_notification.server_chan_send_key"
         ));
         assert!(!is_sensitive_admin_system_config_key("site_name"));
@@ -2947,6 +3161,51 @@ mod tests {
                 "module.notification_email.enabled".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn legacy_server_chan_config_keys_normalize_to_push_module() {
+        assert_eq!(
+            normalize_admin_system_config_key("module.important_notification.server_chan_send_key"),
+            "module.server_chan_push.send_key"
+        );
+        assert_eq!(
+            admin_system_config_delete_keys("module.server_chan_push.send_key"),
+            vec![
+                "module.server_chan_push.send_key".to_string(),
+                "module.important_notification.server_chan_send_key".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn notification_service_items_are_normalized() {
+        let update = parse_admin_system_config_update(
+            "module.important_notification.items",
+            r#"{
+                "value": [
+                    {
+                        "key": "user_balance_low",
+                        "name": " 用户余额不足 ",
+                        "enabled": true,
+                        "channel": "serverchan",
+                        "title_template": " 余额提醒 ",
+                        "markdown_template": " {body} ",
+                        "text_template": null,
+                        "user_email_enabled": true,
+                        "system": true
+                    }
+                ]
+            }"#
+            .as_bytes(),
+        )
+        .expect("items should parse");
+
+        assert_eq!(update.normalized_key, "module.important_notification.items");
+        assert_eq!(update.value[0]["channel"], json!("server_chan"));
+        assert_eq!(update.value[0]["name"], json!("用户余额不足"));
+        assert_eq!(update.value[0]["text_template"], json!(""));
+        assert_eq!(update.value[0]["user_email_enabled"], json!(true));
     }
 
     #[test]

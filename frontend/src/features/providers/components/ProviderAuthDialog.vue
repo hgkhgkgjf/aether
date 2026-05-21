@@ -247,7 +247,7 @@
                 额度提醒
               </Label>
               <p class="mt-1 text-xs text-muted-foreground">
-                余额低于阈值时通过重要通知发送提醒
+                余额低于阈值时通过通知服务发送提醒
               </p>
             </div>
             <Switch v-model="quotaAlert.enabled" />

@@ -918,16 +918,20 @@ export const adminApi = {
     return response.data
   },
 
-  async testImportantNotification(channel: 'all' | 'email' | 'server_chan' = 'all'): Promise<{
+  async testImportantNotification(options: 'all' | 'email' | 'server_chan' | {
+    channel?: 'all' | 'email' | 'server_chan'
+    item_key?: string
+  } = 'all'): Promise<{
     success: boolean
     message: string
     channels: Array<{ channel: string; success: boolean; message: string }>
   }> {
+    const payload = typeof options === 'string' ? { channel: options } : options
     const response = await apiClient.post<{
       success: boolean
       message: string
       channels: Array<{ channel: string; success: boolean; message: string }>
-    }>('/api/admin/system/important-notification/test', { channel })
+    }>('/api/admin/system/important-notification/test', payload)
     return response.data
   },
 

@@ -1,14 +1,14 @@
 <template>
   <PageContainer>
     <PageHeader
-      title="重要通知"
-      description="配置后台任务使用的邮件和 Server 酱通知通道"
+      title="通知服务"
+      description="统一管理通知项、通知模板和推送服务选择"
     />
 
     <div class="mt-6 space-y-6">
       <CardSection
-        title="模块开关"
-        description="启用后，额度提醒等后台任务可以发送重要通知"
+        title="通知服务配置"
+        description="选择全局推送服务，并配置邮件和第三方推送渠道"
       >
         <template #actions>
           <Button
@@ -20,158 +20,321 @@
           </Button>
         </template>
 
-        <div class="flex items-center justify-between gap-4">
-          <div>
-            <Label class="text-sm font-medium">
-              启用重要通知
-            </Label>
-            <p class="mt-1 text-xs text-muted-foreground">
-              {{ anyChannelConfigurable
-                ? '至少配置一个可用通道后再启用'
-                : '请先完成邮件或 Server 酱通道配置后再启用'
-              }}
-            </p>
-          </div>
-          <Switch
-            v-model="config.enabled"
-            :disabled="!anyChannelConfigurable"
-          />
-        </div>
-      </CardSection>
-
-      <CardSection
-        title="邮件通知"
-        description="使用系统 SMTP 配置向固定收件人发送提醒"
-      >
-        <div class="space-y-4">
-          <div class="flex items-center justify-between gap-4">
+        <div class="space-y-6">
+          <div class="grid gap-4 lg:grid-cols-[minmax(0,1fr)_320px]">
             <div>
-              <Label class="text-sm font-medium">
-                启用邮件通道
+              <Label class="block text-sm font-medium">
+                全局推送服务
               </Label>
-              <p
-                v-if="emailChannelConfigurable"
-                class="mt-1 text-xs text-muted-foreground"
-              >
-                SMTP 服务在邮件配置中维护
-              </p>
-              <p
-                v-else
-                class="mt-1 text-xs text-destructive"
-              >
-                <template v-if="!smtpConfigured">
-                  请先在
-                  <RouterLink
-                    to="/admin/email"
-                    class="hover:underline"
-                  >
-                    邮件配置
-                  </RouterLink>
-                  中配置 SMTP，
-                </template>
-                <template v-else>
-                  请先
-                </template>
-                填写至少一个收件人后再启用
-              </p>
+              <Select v-model="config.default_channel">
+                <SelectTrigger class="mt-1">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">
+                    所有可用服务
+                  </SelectItem>
+                  <SelectItem value="email">
+                    邮件
+                  </SelectItem>
+                  <SelectItem value="server_chan">
+                    Server 酱
+                  </SelectItem>
+                </SelectContent>
+              </Select>
             </div>
-            <Switch
-              v-model="config.email_enabled"
-              :disabled="!emailChannelConfigurable"
-            />
+
+            <div class="flex items-center justify-between gap-4">
+              <div>
+                <Label class="text-sm font-medium">
+                  启用通知服务
+                </Label>
+                <p class="mt-1 text-xs text-muted-foreground">
+                  {{ canEnableService ? '当前策略有可用推送服务' : '当前策略没有可用推送服务' }}
+                </p>
+              </div>
+              <Switch
+                v-model="config.enabled"
+                :disabled="!canEnableService"
+              />
+            </div>
           </div>
 
-          <div>
-            <Label
-              for="important-notification-recipients"
-              class="block text-sm font-medium"
-            >
-              收件人
-            </Label>
-            <Textarea
-              id="important-notification-recipients"
-              v-model="config.email_recipients"
-              rows="4"
-              placeholder="ops@example.com&#10;admin@example.com"
-              class="mt-1"
-            />
-            <p class="mt-1 text-xs text-muted-foreground">
-              支持换行、逗号或分号分隔
-            </p>
-          </div>
-        </div>
-      </CardSection>
+          <div class="grid gap-6 border-t border-border/60 pt-5 lg:grid-cols-2">
+            <section class="space-y-4">
+              <div class="flex items-center justify-between gap-3">
+                <div>
+                  <div class="flex items-center gap-2">
+                    <Label class="text-sm font-medium">
+                      邮件配置
+                    </Label>
+                    <Badge :variant="emailReady ? 'success' : 'outline'">
+                      {{ emailReady ? '可用' : '未就绪' }}
+                    </Badge>
+                  </div>
+                  <p class="mt-1 text-xs text-muted-foreground">
+                    SMTP 配置在
+                    <RouterLink
+                      to="/admin/email"
+                      class="text-primary hover:underline"
+                    >
+                      邮件配置
+                    </RouterLink>
+                    中维护
+                  </p>
+                </div>
+                <Switch
+                  v-model="config.email_enabled"
+                  :disabled="!smtpConfigured"
+                />
+              </div>
 
-      <CardSection
-        title="Server 酱"
-        description="通过 Server 酱 Turbo SendKey 推送微信提醒"
-      >
-        <div class="space-y-4">
-          <div class="flex items-center justify-between gap-4">
-            <div>
-              <Label class="text-sm font-medium">
-                启用 Server 酱通道
-              </Label>
-              <p
-                v-if="serverChanKeyIsSet"
-                class="mt-1 text-xs text-muted-foreground"
-              >
-                请求地址使用 Server 酱 Turbo 官方接口
-              </p>
-              <p
-                v-else
-                class="mt-1 text-xs text-destructive"
-              >
-                请先前往
-                <RouterLink
-                  to="/admin/server-chan"
-                  class="hover:underline"
+              <div>
+                <Label
+                  for="notification-service-recipients"
+                  class="block text-sm font-medium"
                 >
-                  Server 酱
-                </RouterLink>
-                配置 SendKey 后再启用
-              </p>
-            </div>
-            <Switch
-              v-model="config.server_chan_enabled"
-              :disabled="!serverChanKeyIsSet"
-            />
-          </div>
+                  管理员收件人
+                </Label>
+                <Textarea
+                  id="notification-service-recipients"
+                  v-model="config.email_recipients"
+                  rows="4"
+                  placeholder="ops@example.com&#10;admin@example.com"
+                  class="mt-1"
+                />
+              </div>
+            </section>
 
-          <p
-            v-if="serverChanKeyIsSet"
-            class="text-xs text-muted-foreground"
+            <section class="space-y-4">
+              <div class="flex items-center justify-between gap-3">
+                <div>
+                  <div class="flex items-center gap-2">
+                    <Label class="text-sm font-medium">
+                      Server 酱
+                    </Label>
+                    <Badge :variant="serverChanReady ? 'success' : 'outline'">
+                      {{ serverChanReady ? '可用' : '未就绪' }}
+                    </Badge>
+                  </div>
+                  <p class="mt-1 text-xs text-muted-foreground">
+                    第三方推送服务在扩展模块中独立启用
+                  </p>
+                </div>
+              </div>
+
+              <RouterLink
+                to="/admin/modules/server-chan"
+                class="inline-flex h-11 items-center rounded-xl border border-border/60 bg-card/60 px-4 text-sm font-semibold text-foreground hover:border-primary/60 hover:bg-primary/10 hover:text-primary"
+              >
+                配置 Server 酱推送
+              </RouterLink>
+            </section>
+          </div>
+        </div>
+      </CardSection>
+
+      <CardSection
+        title="通知项"
+        description="每个通知项可以继承全局服务，也可以单独指定推送服务"
+      >
+        <template #actions>
+          <Button
+            size="sm"
+            variant="outline"
+            @click="addItem"
           >
-            前往
-            <RouterLink
-              to="/admin/server-chan"
-              class="text-primary hover:underline"
-            >
-              Server 酱
-            </RouterLink>
-            配置 SendKey 与通知模板。
-          </p>
+            <Plus class="mr-1.5 h-4 w-4" />
+            添加通知项
+          </Button>
+        </template>
+
+        <div class="space-y-4">
+          <div
+            v-for="(item, index) in config.items"
+            :key="item.local_id"
+            class="rounded-lg border border-border/70 p-4"
+          >
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div class="min-w-0">
+                <div class="flex flex-wrap items-center gap-2">
+                  <Label class="text-sm font-semibold">
+                    {{ item.name || item.key || '未命名通知项' }}
+                  </Label>
+                  <Badge
+                    v-if="item.system"
+                    variant="outline"
+                  >
+                    内置
+                  </Badge>
+                  <Badge :variant="isItemReady(item) ? 'success' : 'outline'">
+                    {{ isItemReady(item) ? '可投递' : '未就绪' }}
+                  </Badge>
+                </div>
+                <p class="mt-1 truncate text-xs text-muted-foreground">
+                  {{ item.key }}
+                </p>
+              </div>
+              <div class="flex items-center gap-2">
+                <Switch v-model="item.enabled" />
+                <Button
+                  v-if="!item.system"
+                  size="icon"
+                  variant="ghost"
+                  @click="removeItem(index)"
+                >
+                  <Trash2 class="h-4 w-4" />
+                </Button>
+              </div>
+            </div>
+
+            <div class="mt-4 grid gap-4 lg:grid-cols-2">
+              <div>
+                <Label class="block text-xs font-medium">
+                  通知键
+                </Label>
+                <Input
+                  v-model="item.key"
+                  class="mt-1"
+                  :disabled="item.system"
+                  placeholder="custom_event"
+                />
+              </div>
+              <div>
+                <Label class="block text-xs font-medium">
+                  名称
+                </Label>
+                <Input
+                  v-model="item.name"
+                  class="mt-1"
+                  placeholder="自定义通知"
+                />
+              </div>
+              <div>
+                <Label class="block text-xs font-medium">
+                  推送服务
+                </Label>
+                <Select v-model="item.channel">
+                  <SelectTrigger class="mt-1">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="global">
+                      使用全局
+                    </SelectItem>
+                    <SelectItem value="all">
+                      所有可用服务
+                    </SelectItem>
+                    <SelectItem value="email">
+                      邮件
+                    </SelectItem>
+                    <SelectItem value="server_chan">
+                      Server 酱
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div class="flex items-center justify-between rounded-lg border border-border/70 px-4 py-3">
+                <div>
+                  <Label class="text-xs font-medium">
+                    用户邮件
+                  </Label>
+                  <p class="mt-1 text-xs text-muted-foreground">
+                    允许发送到用户自己的邮箱
+                  </p>
+                </div>
+                <Switch
+                  v-model="item.user_email_enabled"
+                  :disabled="!smtpConfigured"
+                />
+              </div>
+            </div>
+
+            <div class="mt-4 grid gap-4">
+              <div>
+                <Label class="block text-xs font-medium">
+                  标题模板
+                </Label>
+                <Input
+                  v-model="item.title_template"
+                  class="mt-1"
+                  placeholder="{title}"
+                />
+              </div>
+              <div class="grid gap-4 lg:grid-cols-2">
+                <div>
+                  <Label class="block text-xs font-medium">
+                    Markdown 模板
+                  </Label>
+                  <Textarea
+                    v-model="item.markdown_template"
+                    rows="5"
+                    class="mt-1 font-mono text-sm"
+                    placeholder="{body}"
+                  />
+                </div>
+                <div>
+                  <Label class="block text-xs font-medium">
+                    文本模板
+                  </Label>
+                  <Textarea
+                    v-model="item.text_template"
+                    rows="5"
+                    class="mt-1 font-mono text-sm"
+                    placeholder="{text_body}"
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
       </CardSection>
 
       <CardSection
         title="测试通知"
-        description="按当前已保存配置发送一条重要通知测试"
+        description="按已保存配置发送测试通知"
       >
-        <div class="flex flex-wrap gap-2">
+        <div class="grid gap-3 sm:grid-cols-[minmax(0,1fr)_180px_auto]">
+          <Select v-model="testItemKey">
+            <SelectTrigger>
+              <SelectValue placeholder="选择通知项" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem
+                v-for="item in config.items"
+                :key="item.local_id"
+                :value="item.key"
+              >
+                {{ item.name || item.key }}
+              </SelectItem>
+            </SelectContent>
+          </Select>
+          <Select v-model="testChannel">
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="global">
+                按通知项
+              </SelectItem>
+              <SelectItem value="all">
+                所有可用服务
+              </SelectItem>
+              <SelectItem value="email">
+                邮件
+              </SelectItem>
+              <SelectItem value="server_chan">
+                Server 酱
+              </SelectItem>
+            </SelectContent>
+          </Select>
           <Button
             variant="outline"
-            :disabled="testingAll || !anyChannelConfigurable"
-            @click="testChannel('all')"
+            :disabled="testing || !testItemKey"
+            @click="handleTest"
           >
-            {{ testingAll ? '发送中...' : '测试全部通道' }}
-          </Button>
-          <Button
-            variant="outline"
-            :disabled="testingEmail || !emailChannelConfigurable"
-            @click="testChannel('email')"
-          >
-            {{ testingEmail ? '发送中...' : '测试邮件' }}
+            <Send class="mr-1.5 h-4 w-4" />
+            {{ testing ? '发送中...' : '发送测试' }}
           </Button>
         </div>
 
@@ -182,7 +345,7 @@
           <div
             v-for="item in lastTestResult"
             :key="item.channel"
-            class="flex items-center justify-between rounded-md border border-border px-3 py-2 text-sm"
+            class="flex items-center justify-between gap-4 rounded-md border border-border px-3 py-2 text-sm"
           >
             <span>{{ formatChannel(item.channel) }}</span>
             <span :class="item.success ? 'text-green-600 dark:text-green-400' : 'text-destructive'">
@@ -198,55 +361,128 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { RouterLink } from 'vue-router'
-import Button from '@/components/ui/button.vue'
-import Label from '@/components/ui/label.vue'
-import Switch from '@/components/ui/switch.vue'
-import Textarea from '@/components/ui/textarea.vue'
+import { Plus, Send, Trash2 } from 'lucide-vue-next'
+import {
+  Badge,
+  Button,
+  Input,
+  Label,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+  Switch,
+  Textarea,
+} from '@/components/ui'
 import { PageHeader, PageContainer, CardSection } from '@/components/layout'
 import { adminApi } from '@/api/admin'
-import { modulesApi } from '@/api/modules'
+import { modulesApi, type ModuleStatus } from '@/api/modules'
 import { useToast } from '@/composables/useToast'
 import { parseApiError } from '@/utils/errorParser'
 import { log } from '@/utils/logger'
+
+type DeliveryChannel = 'global' | 'all' | 'email' | 'server_chan'
+
+interface NotificationItem {
+  local_id: string
+  key: string
+  name: string
+  enabled: boolean
+  channel: DeliveryChannel
+  title_template: string
+  markdown_template: string
+  text_template: string
+  user_email_enabled: boolean
+  system: boolean
+}
+
+interface NotificationConfig {
+  enabled: boolean
+  email_enabled: boolean
+  email_recipients: string
+  default_channel: Exclude<DeliveryChannel, 'global'>
+  items: NotificationItem[]
+}
 
 const CONFIG_KEYS = {
   enabled: 'module.important_notification.enabled',
   email_enabled: 'module.important_notification.email_enabled',
   email_recipients: 'module.important_notification.email_recipients',
-  server_chan_enabled: 'module.important_notification.server_chan_enabled',
-  server_chan_send_key: 'module.important_notification.server_chan_send_key',
+  default_channel: 'module.important_notification.default_channel',
+  items: 'module.important_notification.items',
+  server_chan_send_key: 'module.server_chan_push.send_key',
 } as const
 
-interface ImportantNotificationConfig {
-  enabled: boolean
-  email_enabled: boolean
-  email_recipients: string
-  server_chan_enabled: boolean
-}
+const DEFAULT_ITEMS: NotificationItem[] = [
+  {
+    local_id: 'provider_quota_alert',
+    key: 'provider_quota_alert',
+    name: '号池额度不足',
+    enabled: true,
+    channel: 'global',
+    title_template: '',
+    markdown_template: '',
+    text_template: '',
+    user_email_enabled: false,
+    system: true,
+  },
+  {
+    local_id: 'provider_pool_abnormal',
+    key: 'provider_pool_abnormal',
+    name: '号池异常',
+    enabled: true,
+    channel: 'global',
+    title_template: '号池异常：{provider_name}',
+    markdown_template: '号池 `{provider_name}` 出现异常，请检查服务状态。',
+    text_template: '号池 {provider_name} 出现异常，请检查服务状态。',
+    user_email_enabled: false,
+    system: true,
+  },
+  {
+    local_id: 'user_balance_low',
+    key: 'user_balance_low',
+    name: '用户余额不足',
+    enabled: true,
+    channel: 'email',
+    title_template: '余额不足提醒',
+    markdown_template: '你的账户余额已低于提醒阈值，请及时处理。',
+    text_template: '你的账户余额已低于提醒阈值，请及时处理。',
+    user_email_enabled: true,
+    system: true,
+  },
+]
 
 const { success, error } = useToast()
 
 const saving = ref(false)
-const testingAll = ref(false)
-const testingEmail = ref(false)
-const lastTestResult = ref<Array<{ channel: string; success: boolean; message: string }>>([])
-
+const testing = ref(false)
 const smtpConfigured = ref(false)
 const serverChanKeyIsSet = ref(false)
+const serverChanStatus = ref<ModuleStatus | null>(null)
+const testItemKey = ref('provider_quota_alert')
+const testChannel = ref<DeliveryChannel>('global')
+const lastTestResult = ref<Array<{ channel: string; success: boolean; message: string }>>([])
 
-const config = ref<ImportantNotificationConfig>({
+const config = ref<NotificationConfig>({
   enabled: false,
   email_enabled: false,
   email_recipients: '',
-  server_chan_enabled: false,
+  default_channel: 'all',
+  items: cloneDefaultItems(),
 })
 
-const emailChannelConfigurable = computed(() => {
-  return smtpConfigured.value && config.value.email_recipients.trim() !== ''
+const emailReady = computed(() => {
+  return config.value.email_enabled && smtpConfigured.value && config.value.email_recipients.trim() !== ''
 })
 
-const anyChannelConfigurable = computed(() => {
-  return emailChannelConfigurable.value || serverChanKeyIsSet.value
+const serverChanReady = computed(() => {
+  return serverChanStatus.value?.enabled === true && serverChanKeyIsSet.value
+})
+
+const canEnableService = computed(() => {
+  if (deliveryReady(config.value.default_channel)) return true
+  return config.value.items.some(item => item.enabled && isItemReady(item))
 })
 
 onMounted(() => {
@@ -259,7 +495,9 @@ async function loadConfig() {
       moduleStatus,
       emailEnabled,
       recipients,
-      serverChanEnabled,
+      defaultChannel,
+      items,
+      serverChanModuleStatus,
       serverChanKey,
       smtpHost,
       smtpFromEmail,
@@ -267,7 +505,9 @@ async function loadConfig() {
       modulesApi.getStatus('important_notification'),
       adminApi.getSystemConfig(CONFIG_KEYS.email_enabled),
       adminApi.getSystemConfig(CONFIG_KEYS.email_recipients),
-      adminApi.getSystemConfig(CONFIG_KEYS.server_chan_enabled),
+      adminApi.getSystemConfig(CONFIG_KEYS.default_channel),
+      adminApi.getSystemConfig(CONFIG_KEYS.items),
+      modulesApi.getStatus('server_chan_push'),
       adminApi.getSystemConfig(CONFIG_KEYS.server_chan_send_key),
       adminApi.getSystemConfig('smtp_host'),
       adminApi.getSystemConfig('smtp_from_email'),
@@ -276,43 +516,49 @@ async function loadConfig() {
     config.value.enabled = moduleStatus.enabled === true
     config.value.email_enabled = emailEnabled.value === true
     config.value.email_recipients = normalizeRecipients(recipients.value)
-    config.value.server_chan_enabled = serverChanEnabled.value === true
+    config.value.default_channel = normalizeDefaultChannel(defaultChannel.value)
+    config.value.items = normalizeItems(items.value)
+    serverChanStatus.value = serverChanModuleStatus
     serverChanKeyIsSet.value = serverChanKey.is_set === true
     smtpConfigured.value = isNonEmptyString(smtpHost.value) && isNonEmptyString(smtpFromEmail.value)
+    if (!config.value.items.some(item => item.key === testItemKey.value)) {
+      testItemKey.value = config.value.items[0]?.key || ''
+    }
   } catch (err) {
-    error(parseApiError(err, '加载重要通知配置失败'))
-    log.error('加载重要通知配置失败:', err)
+    error(parseApiError(err, '加载通知服务配置失败'))
+    log.error('加载通知服务配置失败:', err)
   }
 }
 
 async function saveConfig() {
   saving.value = true
   try {
-    if (!config.value.enabled) {
-      await adminApi.updateSystemConfig(CONFIG_KEYS.enabled, false, '重要通知模块总开关')
+    if (!canEnableService.value) {
+      config.value.enabled = false
     }
-
     await Promise.all([
-      adminApi.updateSystemConfig(CONFIG_KEYS.email_enabled, config.value.email_enabled, '重要通知邮件通道开关'),
-      adminApi.updateSystemConfig(CONFIG_KEYS.email_recipients, config.value.email_recipients, '重要通知邮件收件人'),
-      adminApi.updateSystemConfig(CONFIG_KEYS.server_chan_enabled, config.value.server_chan_enabled, '重要通知 Server 酱通道开关'),
+      adminApi.updateSystemConfig(CONFIG_KEYS.email_enabled, config.value.email_enabled, '通知服务邮件推送开关'),
+      adminApi.updateSystemConfig(CONFIG_KEYS.email_recipients, config.value.email_recipients, '通知服务管理员收件人'),
+      adminApi.updateSystemConfig(CONFIG_KEYS.default_channel, config.value.default_channel, '通知服务全局推送服务'),
+      adminApi.updateSystemConfig(CONFIG_KEYS.items, serializeItems(), '通知服务通知项和模板'),
     ])
-    if (config.value.enabled) {
-      await adminApi.updateSystemConfig(CONFIG_KEYS.enabled, true, '重要通知模块总开关')
-    }
-    success('重要通知配置已保存')
+    await adminApi.updateSystemConfig(CONFIG_KEYS.enabled, config.value.enabled, '通知服务总开关')
+    success('通知服务配置已保存')
   } catch (err) {
-    error(parseApiError(err, '保存重要通知配置失败'))
-    log.error('保存重要通知配置失败:', err)
+    error(parseApiError(err, '保存通知服务配置失败'))
+    log.error('保存通知服务配置失败:', err)
   } finally {
     saving.value = false
   }
 }
 
-async function testChannel(channel: 'all' | 'email') {
-  setTesting(channel, true)
+async function handleTest() {
+  testing.value = true
   try {
-    const result = await adminApi.testImportantNotification(channel)
+    const result = await adminApi.testImportantNotification({
+      item_key: testItemKey.value,
+      channel: testChannel.value === 'global' ? undefined : testChannel.value,
+    })
     lastTestResult.value = result.channels || []
     if (result.success) {
       success(result.message || '测试通知已发送')
@@ -321,15 +567,111 @@ async function testChannel(channel: 'all' | 'email') {
     }
   } catch (err) {
     error(parseApiError(err, '测试通知发送失败'))
-    log.error('测试重要通知失败:', err)
+    log.error('测试通知服务失败:', err)
   } finally {
-    setTesting(channel, false)
+    testing.value = false
   }
 }
 
-function setTesting(channel: 'all' | 'email', value: boolean) {
-  if (channel === 'all') testingAll.value = value
-  if (channel === 'email') testingEmail.value = value
+function addItem() {
+  const suffix = Date.now().toString(36)
+  const key = `custom_${suffix}`
+  config.value.items.push({
+    local_id: key,
+    key,
+    name: '自定义通知',
+    enabled: true,
+    channel: 'global',
+    title_template: '',
+    markdown_template: '',
+    text_template: '',
+    user_email_enabled: false,
+    system: false,
+  })
+  testItemKey.value = key
+}
+
+function removeItem(index: number) {
+  const [removed] = config.value.items.splice(index, 1)
+  if (removed?.key === testItemKey.value) {
+    testItemKey.value = config.value.items[0]?.key || ''
+  }
+}
+
+function isItemReady(item: NotificationItem): boolean {
+  if (!item.enabled) return false
+  return deliveryReady(resolveItemChannel(item))
+}
+
+function deliveryReady(channel: Exclude<DeliveryChannel, 'global'>): boolean {
+  if (channel === 'all') return emailReady.value || serverChanReady.value
+  if (channel === 'email') return emailReady.value
+  if (channel === 'server_chan') return serverChanReady.value
+  return false
+}
+
+function resolveItemChannel(item: NotificationItem): Exclude<DeliveryChannel, 'global'> {
+  return item.channel === 'global' ? config.value.default_channel : item.channel
+}
+
+function serializeItems() {
+  return config.value.items.map(item => ({
+    key: normalizeItemKey(item.key),
+    name: item.name.trim() || normalizeItemKey(item.key),
+    enabled: item.enabled,
+    channel: item.channel,
+    title_template: item.title_template.trim(),
+    markdown_template: item.markdown_template.trim(),
+    text_template: item.text_template.trim(),
+    user_email_enabled: item.user_email_enabled,
+    system: item.system,
+  }))
+}
+
+function normalizeItems(value: unknown): NotificationItem[] {
+  if (!Array.isArray(value)) return cloneDefaultItems()
+  const items = value
+    .map((item, index) => normalizeItem(item, index))
+    .filter((item): item is NotificationItem => item !== null)
+  return items.length > 0 ? items : cloneDefaultItems()
+}
+
+function normalizeItem(value: unknown, index: number): NotificationItem | null {
+  if (!value || typeof value !== 'object') return null
+  const raw = value as Record<string, unknown>
+  const key = normalizeItemKey(raw.key)
+  if (!key) return null
+  return {
+    local_id: `${key}_${index}`,
+    key,
+    name: typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim() : key,
+    enabled: raw.enabled !== false,
+    channel: normalizeItemChannel(raw.channel),
+    title_template: typeof raw.title_template === 'string' ? raw.title_template : '',
+    markdown_template: typeof raw.markdown_template === 'string' ? raw.markdown_template : '',
+    text_template: typeof raw.text_template === 'string' ? raw.text_template : '',
+    user_email_enabled: raw.user_email_enabled === true,
+    system: raw.system === true,
+  }
+}
+
+function normalizeItemKey(value: unknown): string {
+  if (typeof value !== 'string') return ''
+  return value.trim().replace(/[^A-Za-z0-9_.:-]/g, '_').slice(0, 64)
+}
+
+function normalizeItemChannel(value: unknown): DeliveryChannel {
+  if (value === 'all' || value === 'email' || value === 'server_chan') return value
+  return 'global'
+}
+
+function normalizeDefaultChannel(value: unknown): Exclude<DeliveryChannel, 'global'> {
+  if (value === 'email' || value === 'server_chan') return value
+  return 'all'
+}
+
+function cloneDefaultItems(): NotificationItem[] {
+  return DEFAULT_ITEMS.map(item => ({ ...item }))
 }
 
 function isNonEmptyString(value: unknown): boolean {
@@ -349,7 +691,10 @@ function normalizeRecipients(value: unknown): string {
 function formatChannel(channel: string): string {
   if (channel === 'email') return '邮件'
   if (channel === 'server_chan') return 'Server 酱'
+  if (channel === 'user_email') return '用户邮件'
   if (channel === 'module') return '模块'
+  if (channel === 'item') return '通知项'
+  if (channel === 'none') return '无可用服务'
   return channel
 }
 </script>

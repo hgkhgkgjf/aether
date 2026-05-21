@@ -809,7 +809,12 @@ async fn gateway_handles_admin_modules_status_locally_with_trusted_admin_princip
     );
     assert_eq!(
         payload["important_notification"]["admin_route"],
-        "/admin/modules/important-notification"
+        "/admin/notification-service"
+    );
+    assert_eq!(payload["server_chan_push"]["display_name"], "Server 酱推送");
+    assert_eq!(
+        payload["server_chan_push"]["admin_route"],
+        "/admin/modules/server-chan"
     );
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 

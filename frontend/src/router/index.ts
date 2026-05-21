@@ -276,15 +276,23 @@ const routes: RouteRecordRaw[] = [
       },
       {
         path: 'modules/important-notification',
+        redirect: '/admin/notification-service'
+      },
+      {
+        path: 'notification-service',
         name: 'ImportantNotificationModule',
         component: () => importWithRetry(() => import('@/views/admin/modules/ImportantNotification.vue')),
         meta: { module: 'important_notification' }
       },
       {
         path: 'server-chan',
+        redirect: '/admin/modules/server-chan'
+      },
+      {
+        path: 'modules/server-chan',
         name: 'ServerChanSettings',
         component: () => importWithRetry(() => import('@/views/admin/modules/ServerChanSettings.vue')),
-        meta: { module: 'important_notification' }
+        meta: { module: 'server_chan_push' }
       },
       {
         path: 'email',
