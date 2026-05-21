@@ -48,9 +48,9 @@ use self::execution_failures::{
     handle_prefetch_stream_failure, submit_midstream_stream_failure, StreamFailureReport,
 };
 use crate::ai_serving::api::{
-    maybe_bridge_standard_sync_json_to_stream, maybe_build_provider_private_stream_normalizer,
-    maybe_build_stream_response_rewriter, normalize_provider_private_report_context,
-    StreamingStandardTerminalObserver,
+    is_openai_responses_family_format, maybe_bridge_standard_sync_json_to_stream,
+    maybe_build_provider_private_stream_normalizer, maybe_build_stream_response_rewriter,
+    normalize_provider_private_report_context, StreamingStandardTerminalObserver,
 };
 use crate::api::response::{
     attach_control_metadata_headers, build_client_response, build_client_response_from_parts,
@@ -712,12 +712,69 @@ fn stream_terminal_summary_missing_observed_finish(
     })
 }
 
-fn stream_terminal_summary_represents_failure(
+fn stream_report_context_format_field<'a>(
+    report_context: Option<&'a Value>,
+    field: &str,
+) -> Option<&'a str> {
+    report_context
+        .and_then(Value::as_object)
+        .and_then(|object| object.get(field))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn stream_requires_observed_terminal_event(
+    provider_api_format: &str,
+    report_context: Option<&Value>,
+) -> bool {
+    is_openai_responses_family_format(provider_api_format)
+        || [
+            "provider_stream_event_api_format",
+            "provider_stream_api_format",
+            "provider_api_format",
+        ]
+        .into_iter()
+        .filter_map(|field| stream_report_context_format_field(report_context, field))
+        .any(is_openai_responses_family_format)
+}
+
+fn stream_terminal_summary_missing_observed_finish_with_requirement(
     summary: Option<&ExecutionStreamTerminalSummary>,
+    requires_observed_terminal_event: bool,
+) -> bool {
+    if !requires_observed_terminal_event {
+        return stream_terminal_summary_missing_observed_finish(summary);
+    }
+
+    summary.is_some_and(|summary| !summary.observed_finish)
+}
+
+fn ensure_stream_terminal_summary_for_missing_observed_finish(
+    summary: &mut Option<ExecutionStreamTerminalSummary>,
+    requires_observed_terminal_event: bool,
+) {
+    if !requires_observed_terminal_event {
+        return;
+    }
+
+    let summary = summary.get_or_insert_with(ExecutionStreamTerminalSummary::default);
+    if !summary.observed_finish && summary.parser_error.is_none() {
+        summary.parser_error =
+            Some("execution runtime stream ended before provider terminal event".to_string());
+    }
+}
+
+fn stream_terminal_summary_represents_failure_with_requirement(
+    summary: Option<&ExecutionStreamTerminalSummary>,
+    requires_observed_terminal_event: bool,
 ) -> bool {
     summary.is_some_and(|summary| {
         summary.parser_error.is_some()
-            || stream_terminal_summary_missing_observed_finish(Some(summary))
+            || stream_terminal_summary_missing_observed_finish_with_requirement(
+                Some(summary),
+                requires_observed_terminal_event,
+            )
     })
 }
 
@@ -3353,8 +3410,19 @@ async fn execute_stream_from_frame_stream(
             report_context_owned.as_ref(),
             &mut stream_terminal_summary,
         );
+        let requires_observed_terminal_event = stream_requires_observed_terminal_event(
+            plan_for_report.provider_api_format.as_str(),
+            stream_usage_report_context.as_ref(),
+        );
+        ensure_stream_terminal_summary_for_missing_observed_finish(
+            &mut stream_terminal_summary,
+            requires_observed_terminal_event,
+        );
         let missing_observed_finish =
-            stream_terminal_summary_missing_observed_finish(stream_terminal_summary.as_ref());
+            stream_terminal_summary_missing_observed_finish_with_requirement(
+                stream_terminal_summary.as_ref(),
+                requires_observed_terminal_event,
+            );
 
         let should_submit_report = report_kind_owned.is_some();
         let terminal_telemetry = Some(build_terminal_stream_telemetry(
@@ -3363,8 +3431,10 @@ async fn execute_stream_from_frame_stream(
             usage_stream_telemetry.as_ref(),
             provider_stream_bytes.load(Ordering::Relaxed),
         ));
-        let stream_failed =
-            stream_terminal_summary_represents_failure(stream_terminal_summary.as_ref());
+        let stream_failed = stream_terminal_summary_represents_failure_with_requirement(
+            stream_terminal_summary.as_ref(),
+            requires_observed_terminal_event,
+        );
         let stream_terminal_error_message = stream_terminal_summary
             .as_ref()
             .and_then(|summary| summary.parser_error.clone())
@@ -3555,11 +3625,14 @@ mod tests {
     use tokio::sync::{mpsc, watch, Notify};
 
     use super::{
-        build_sse_body_stream, execute_execution_runtime_stream, execute_stream_from_frame_stream,
+        build_sse_body_stream, ensure_stream_terminal_summary_for_missing_observed_finish,
+        execute_execution_runtime_stream, execute_stream_from_frame_stream,
         maybe_apply_kiro_prompt_cache_usage_to_stream_summary, merge_stream_terminal_summary,
         should_limit_direct_finalize_prefetch, should_probe_success_failover_before_stream,
         should_skip_direct_finalize_prefetch, stream_chunk_contains_sse_done,
-        stream_terminal_summary_missing_observed_finish,
+        stream_requires_observed_terminal_event, stream_terminal_summary_missing_observed_finish,
+        stream_terminal_summary_missing_observed_finish_with_requirement,
+        stream_terminal_summary_represents_failure_with_requirement,
     };
     use crate::control::GatewayControlDecision;
     use crate::tunnel::{tunnel_protocol, TunnelProxyConn};
@@ -3667,6 +3740,69 @@ mod tests {
             }
         )));
         assert!(!stream_terminal_summary_missing_observed_finish(None));
+    }
+
+    #[test]
+    fn requires_terminal_event_for_openai_responses_streams() {
+        assert!(stream_requires_observed_terminal_event(
+            "openai:responses",
+            None
+        ));
+        assert!(stream_requires_observed_terminal_event(
+            "openai:responses:compact",
+            None
+        ));
+        assert!(!stream_requires_observed_terminal_event(
+            "openai:chat",
+            None
+        ));
+        assert!(stream_requires_observed_terminal_event(
+            "openai:chat",
+            Some(&json!({
+                "provider_stream_event_api_format": "openai:responses"
+            }))
+        ));
+    }
+
+    #[test]
+    fn synthesizes_missing_terminal_summary_for_openai_responses_empty_stream() {
+        let mut summary = None;
+        ensure_stream_terminal_summary_for_missing_observed_finish(&mut summary, true);
+
+        let summary = summary.expect("summary should be synthesized");
+        assert!(!summary.observed_finish);
+        assert_eq!(
+            summary.parser_error.as_deref(),
+            Some("execution runtime stream ended before provider terminal event")
+        );
+        assert!(
+            stream_terminal_summary_missing_observed_finish_with_requirement(Some(&summary), true)
+        );
+        assert!(stream_terminal_summary_represents_failure_with_requirement(
+            Some(&summary),
+            true
+        ));
+    }
+
+    #[test]
+    fn terminal_required_stream_fails_even_with_usage_without_finish() {
+        let mut usage = StandardizedUsage::new();
+        usage.output_tokens = 12;
+        let mut summary = Some(ExecutionStreamTerminalSummary {
+            standardized_usage: Some(usage),
+            observed_finish: false,
+            ..ExecutionStreamTerminalSummary::default()
+        });
+
+        ensure_stream_terminal_summary_for_missing_observed_finish(&mut summary, true);
+        let summary = summary.as_ref().expect("summary should remain present");
+        assert!(
+            stream_terminal_summary_missing_observed_finish_with_requirement(Some(summary), true)
+        );
+        assert!(stream_terminal_summary_represents_failure_with_requirement(
+            Some(summary),
+            true
+        ));
     }
 
     #[test]
