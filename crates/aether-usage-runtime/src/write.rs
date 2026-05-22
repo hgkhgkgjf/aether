@@ -929,8 +929,13 @@ pub fn build_stream_terminal_usage_seed(
             map_usage_from_response(response, context_seed.provider_contract.as_str())
         })
     });
-    let captured_terminal_state =
-        captured_stream_terminal_state(provider_response_full.as_ref(), client_response.as_ref());
+    let captured_terminal_state = captured_stream_terminal_state(
+        report_kind.as_str(),
+        context_seed.client_contract.as_str(),
+        context_seed.provider_contract.as_str(),
+        provider_response_full.as_ref(),
+        client_response.as_ref(),
+    );
     let requires_observed_terminal_event = stream_usage_requires_observed_terminal_event(
         report_kind.as_str(),
         context_seed.client_contract.as_str(),
@@ -1074,12 +1079,29 @@ fn infer_stream_terminal_state(
 }
 
 fn captured_stream_terminal_state(
+    report_kind: &str,
+    client_contract: &str,
+    provider_contract: &str,
     provider_response: Option<&Value>,
     client_response: Option<&Value>,
 ) -> Option<StreamCapturedTerminalState> {
+    let report_kind_requires_terminal_event =
+        stream_report_kind_requires_observed_terminal_event(report_kind);
+    let provider_contract_requires_terminal_event =
+        is_openai_responses_family_format_alias(provider_contract);
+    let client_contract_requires_terminal_event =
+        is_openai_responses_family_format_alias(client_contract);
+    let fallback_requires_terminal_event = report_kind_requires_terminal_event
+        && !provider_contract_requires_terminal_event
+        && !client_contract_requires_terminal_event;
+
     combine_stream_capture_terminal_states(
-        provider_response.and_then(stream_capture_terminal_state),
-        client_response.and_then(stream_capture_terminal_state),
+        (provider_contract_requires_terminal_event || fallback_requires_terminal_event)
+            .then(|| provider_response.and_then(stream_capture_terminal_state))
+            .flatten(),
+        (client_contract_requires_terminal_event || fallback_requires_terminal_event)
+            .then(|| client_response.and_then(stream_capture_terminal_state))
+            .flatten(),
     )
 }
 
@@ -1104,15 +1126,19 @@ fn combine_stream_capture_terminal_states(
     }
 }
 
+fn stream_report_kind_requires_observed_terminal_event(report_kind: &str) -> bool {
+    let report_kind = report_kind.trim().to_ascii_lowercase();
+    report_kind.starts_with("openai_responses_")
+        || report_kind.starts_with("openai_compact_")
+        || report_kind.starts_with("openai_cli_")
+}
+
 fn stream_usage_requires_observed_terminal_event(
     report_kind: &str,
     client_contract: &str,
     provider_contract: &str,
 ) -> bool {
-    let report_kind = report_kind.trim().to_ascii_lowercase();
-    report_kind.starts_with("openai_responses_")
-        || report_kind.starts_with("openai_compact_")
-        || report_kind.starts_with("openai_cli_")
+    stream_report_kind_requires_observed_terminal_event(report_kind)
         || is_openai_responses_family_format_alias(client_contract)
         || is_openai_responses_family_format_alias(provider_contract)
 }

@@ -402,11 +402,77 @@ fn is_openai_responses_family_format_alias(value: &str) -> bool {
 fn stream_report_captured_terminal_state(
     payload: &GatewayStreamReportRequest,
 ) -> Option<StreamCapturedTerminalState> {
-    let provider_state =
-        stream_capture_terminal_state_from_base64(payload.provider_body_base64.as_deref());
-    let client_state =
-        stream_capture_terminal_state_from_base64(payload.client_body_base64.as_deref());
+    let provider_state = stream_report_provider_capture_requires_terminal_event(payload)
+        .then(|| stream_capture_terminal_state_from_base64(payload.provider_body_base64.as_deref()))
+        .flatten();
+    let client_state = stream_report_client_capture_requires_terminal_event(payload)
+        .then(|| stream_capture_terminal_state_from_base64(payload.client_body_base64.as_deref()))
+        .flatten();
     combine_stream_terminal_states(provider_state, client_state)
+}
+
+fn stream_report_provider_capture_requires_terminal_event(
+    payload: &GatewayStreamReportRequest,
+) -> bool {
+    let context = payload.report_context.as_ref();
+    stream_report_context_has_openai_responses_format(
+        context,
+        &[
+            "provider_stream_event_api_format",
+            "provider_stream_api_format",
+            "provider_api_format",
+        ],
+    ) || (stream_report_kind_requires_observed_terminal_event(payload.report_kind.as_str())
+        && !stream_report_context_has_any_format(context))
+}
+
+fn stream_report_client_capture_requires_terminal_event(
+    payload: &GatewayStreamReportRequest,
+) -> bool {
+    let context = payload.report_context.as_ref();
+    stream_report_context_has_openai_responses_format(context, &["client_api_format"])
+        || (stream_report_kind_requires_observed_terminal_event(payload.report_kind.as_str())
+            && !stream_report_context_has_any_format(context))
+}
+
+fn stream_report_context_has_openai_responses_format(
+    report_context: Option<&Value>,
+    fields: &[&str],
+) -> bool {
+    fields
+        .iter()
+        .filter_map(|field| {
+            report_context
+                .and_then(Value::as_object)
+                .and_then(|context| context.get(*field))
+                .and_then(Value::as_str)
+        })
+        .any(is_openai_responses_family_format_alias)
+}
+
+fn stream_report_context_has_any_format(report_context: Option<&Value>) -> bool {
+    [
+        "provider_stream_event_api_format",
+        "provider_stream_api_format",
+        "provider_api_format",
+        "client_api_format",
+    ]
+    .into_iter()
+    .any(|field| {
+        report_context
+            .and_then(Value::as_object)
+            .and_then(|context| context.get(field))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+    })
+}
+
+fn stream_report_kind_requires_observed_terminal_event(report_kind: &str) -> bool {
+    let report_kind = report_kind.trim().to_ascii_lowercase();
+    report_kind.starts_with("openai_responses_")
+        || report_kind.starts_with("openai_compact_")
+        || report_kind.starts_with("openai_cli_")
 }
 
 fn stream_capture_terminal_state_from_base64(
@@ -832,6 +898,33 @@ mod tests {
         payload.provider_body_base64 =
             Some(base64::engine::general_purpose::STANDARD.encode(provider_sse.as_bytes()));
         payload.provider_body_state = Some(UsageBodyCaptureState::Inline);
+
+        assert!(!stream_report_represents_failure(&payload));
+        assert!(!super::stream_report_missing_terminal_event(&payload));
+    }
+
+    #[test]
+    fn accepts_completed_openai_responses_provider_with_rewritten_openai_chat_client_stream() {
+        let provider_sse = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        );
+        let client_sse = concat!(
+            "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mut payload = sample_stream_report("openai_chat_stream_success", 200);
+        payload.report_context = Some(json!({
+            "client_api_format": "openai:chat",
+            "provider_api_format": "openai:responses",
+            "provider_stream_event_api_format": "openai:responses"
+        }));
+        payload.provider_body_base64 =
+            Some(base64::engine::general_purpose::STANDARD.encode(provider_sse.as_bytes()));
+        payload.provider_body_state = Some(UsageBodyCaptureState::Inline);
+        payload.client_body_base64 =
+            Some(base64::engine::general_purpose::STANDARD.encode(client_sse.as_bytes()));
+        payload.client_body_state = Some(UsageBodyCaptureState::Inline);
 
         assert!(!stream_report_represents_failure(&payload));
         assert!(!super::stream_report_missing_terminal_event(&payload));
