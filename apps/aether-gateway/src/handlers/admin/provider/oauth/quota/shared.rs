@@ -317,12 +317,7 @@ pub(super) async fn execute_provider_quota_plan(
     match state.execute_execution_runtime_sync_plan(None, &plan).await {
         Ok(result) => Ok(ProviderQuotaExecutionOutcome::Response(result)),
         Err(err) => {
-            let error = match err {
-                GatewayError::UpstreamUnavailable { message, .. }
-                | GatewayError::ControlUnavailable { message, .. }
-                | GatewayError::Client { message, .. }
-                | GatewayError::Internal(message) => message,
-            };
+            let error = err.into_message();
             let proxy_node_id = plan
                 .proxy
                 .as_ref()

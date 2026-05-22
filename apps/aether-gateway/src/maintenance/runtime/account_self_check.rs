@@ -551,12 +551,7 @@ fn endpoint_for_self_check(
 }
 
 fn gateway_error_message(err: GatewayError) -> String {
-    match err {
-        GatewayError::UpstreamUnavailable { message, .. }
-        | GatewayError::ControlUnavailable { message, .. }
-        | GatewayError::Client { message, .. }
-        | GatewayError::Internal(message) => message,
-    }
+    err.into_message()
 }
 
 fn update_summary_from_outcome(

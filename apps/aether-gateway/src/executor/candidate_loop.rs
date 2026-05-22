@@ -125,7 +125,16 @@ where
             decision,
             plan_kind,
         };
-        run_dynamic_attempt_loop(&port, &mut source).await
+        run_dynamic_attempt_loop(
+            &port,
+            &mut source,
+            trace_id,
+            plan_kind,
+            state
+                .frontdoor_runtime_guards
+                .local_execution_planning_timeout,
+        )
+        .await
     }
     .instrument(span)
     .await
@@ -281,7 +290,16 @@ where
             decision,
             plan_kind,
         };
-        run_dynamic_attempt_loop(&port, &mut source).await
+        run_dynamic_attempt_loop(
+            &port,
+            &mut source,
+            trace_id,
+            plan_kind,
+            state
+                .frontdoor_runtime_guards
+                .local_execution_planning_timeout,
+        )
+        .await
     }
     .instrument(span)
     .await
@@ -290,6 +308,9 @@ where
 async fn run_dynamic_attempt_loop<Port, Source, Attempt>(
     port: &Port,
     source: &mut Source,
+    trace_id: &str,
+    plan_kind: &str,
+    planning_timeout: Duration,
 ) -> Result<LocalExecutionRequestOutcome, GatewayError>
 where
     Port: AiAttemptLoopPort<
@@ -303,7 +324,9 @@ where
 {
     let mut last_attempted = None;
 
-    while let Some(attempt) = source.next_execution_attempt().await? {
+    while let Some(attempt) =
+        next_execution_attempt_with_timeout(source, trace_id, plan_kind, planning_timeout).await?
+    {
         last_attempted = Some((attempt.execution_plan().clone(), attempt.report_context()));
         if let Some(response) = port.execute_attempt(&attempt).await? {
             let remaining = source.drain_execution_attempts().await?;
@@ -320,6 +343,37 @@ where
         port.build_exhaustion(last_plan, last_report_context)
             .await?,
     ))
+}
+
+async fn next_execution_attempt_with_timeout<Source, Attempt>(
+    source: &mut Source,
+    trace_id: &str,
+    plan_kind: &str,
+    planning_timeout: Duration,
+) -> Result<Option<Attempt>, GatewayError>
+where
+    Source: LocalExecutionAttemptSource<Attempt>,
+{
+    match timeout(planning_timeout, source.next_execution_attempt()).await {
+        Ok(result) => result,
+        Err(_) => {
+            let timeout_ms = planning_timeout.as_millis() as u64;
+            warn!(
+                event_name = "local_execution_candidate_planning_timeout",
+                log_type = "ops",
+                trace_id,
+                plan_kind,
+                timeout_ms,
+                phase = "next_execution_attempt",
+                "gateway timed out while planning the next local execution candidate"
+            );
+            Err(GatewayError::LocalExecutionPlanningTimeout {
+                trace_id: trace_id.to_string(),
+                phase: "next_execution_attempt",
+                timeout_ms,
+            })
+        }
+    }
 }
 
 struct StreamAttemptLoopPort<'a> {
@@ -632,6 +686,20 @@ mod tests {
         }
     }
 
+    struct PendingAttemptSource;
+
+    #[async_trait]
+    impl LocalExecutionAttemptSource<()> for PendingAttemptSource {
+        async fn next_execution_attempt(&mut self) -> Result<Option<()>, GatewayError> {
+            std::future::pending::<()>().await;
+            Ok(None)
+        }
+
+        async fn drain_execution_attempts(&mut self) -> Result<Vec<()>, GatewayError> {
+            Ok(Vec::new())
+        }
+    }
+
     fn test_plan(timeouts: Option<ExecutionTimeouts>) -> ExecutionPlan {
         ExecutionPlan {
             request_id: "req_watchdog".to_string(),
@@ -653,6 +721,33 @@ mod tests {
             proxy: None,
             transport_profile: None,
             timeouts,
+        }
+    }
+
+    #[tokio::test]
+    async fn next_execution_attempt_times_out_instead_of_waiting_forever() {
+        let mut source = PendingAttemptSource;
+
+        let err = next_execution_attempt_with_timeout(
+            &mut source,
+            "trace-planning-timeout",
+            "openai_responses_sync",
+            Duration::from_millis(5),
+        )
+        .await
+        .expect_err("pending candidate planning should time out");
+
+        match err {
+            GatewayError::LocalExecutionPlanningTimeout {
+                trace_id,
+                phase,
+                timeout_ms,
+            } => {
+                assert_eq!(trace_id, "trace-planning-timeout");
+                assert_eq!(phase, "next_execution_attempt");
+                assert_eq!(timeout_ms, 5);
+            }
+            other => panic!("unexpected error: {other:?}"),
         }
     }
 

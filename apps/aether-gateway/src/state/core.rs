@@ -21,7 +21,9 @@ use aether_runtime_state::{
 };
 use aether_scheduler_core::PROVIDER_KEY_RPM_WINDOW_SECS;
 
-use super::{AppState, FrontdoorCorsConfig, LocalExecutionRuntimeMissDiagnostic};
+use super::{
+    AppState, FrontdoorCorsConfig, FrontdoorRuntimeGuardConfig, LocalExecutionRuntimeMissDiagnostic,
+};
 
 use super::super::async_task::{
     spawn_video_task_poller, VideoTaskPollerConfig, VideoTaskService, VideoTaskTruthSourceMode,
@@ -227,6 +229,7 @@ impl AppState {
                 VideoTaskTruthSourceMode::PythonSyncReport,
             )),
             video_task_poller: None,
+            frontdoor_runtime_guards: Arc::new(FrontdoorRuntimeGuardConfig::from_env()),
             request_gate: None,
             distributed_request_gate: None,
             client,

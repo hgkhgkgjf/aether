@@ -1448,12 +1448,7 @@ impl AppState {
                 .map_err(
                     |err| provider_transport::LocalOAuthRefreshError::InvalidResponse {
                         provider_type,
-                        message: match err {
-                            GatewayError::UpstreamUnavailable { message, .. }
-                            | GatewayError::ControlUnavailable { message, .. }
-                            | GatewayError::Client { message, .. }
-                            | GatewayError::Internal(message) => message,
-                        },
+                        message: err.into_message(),
                     },
                 )?;
         let response_body_text = local_oauth_execution_body_text(&result);
