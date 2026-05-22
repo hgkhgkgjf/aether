@@ -1464,6 +1464,8 @@ fn build_sse_body_stream(
 #[derive(Default)]
 struct SseControlBlockFilter {
     buffered: Vec<u8>,
+    emitted_len: usize,
+    passthrough_current_block: bool,
 }
 
 impl SseControlBlockFilter {
@@ -1475,17 +1477,39 @@ impl SseControlBlockFilter {
         self.buffered.extend_from_slice(chunk);
         let mut output = Vec::new();
         while let Some((block_end, separator_len)) = find_sse_block_boundary(&self.buffered) {
-            let block = self
-                .buffered
-                .drain(..block_end + separator_len)
-                .collect::<Vec<_>>();
-            if sse_block_has_data_line(&block) {
-                output.extend(block);
+            let block_len = block_end + separator_len;
+            let block = self.buffered.drain(..block_len).collect::<Vec<_>>();
+            if self.passthrough_current_block {
+                let emitted_len = self.emitted_len.min(block.len());
+                output.extend_from_slice(&block[emitted_len..]);
+            } else if sse_block_has_data_line(&block) {
+                output.extend_from_slice(&block);
             }
+            self.emitted_len = 0;
+            self.passthrough_current_block = false;
+        }
+
+        if self.passthrough_current_block {
+            if self.buffered.len() > self.emitted_len {
+                output.extend_from_slice(&self.buffered[self.emitted_len..]);
+                self.emitted_len = self.buffered.len();
+            }
+        } else if sse_buffer_has_data_line(&self.buffered) {
+            self.passthrough_current_block = true;
+            output.extend_from_slice(&self.buffered);
+            self.emitted_len = self.buffered.len();
         }
 
         if self.buffered.len() > SSE_CONTROL_FILTER_MAX_BUFFER_BYTES {
-            output.extend(std::mem::take(&mut self.buffered));
+            let buffered = std::mem::take(&mut self.buffered);
+            if self.passthrough_current_block {
+                let emitted_len = self.emitted_len.min(buffered.len());
+                output.extend_from_slice(&buffered[emitted_len..]);
+            } else {
+                output.extend(buffered);
+            }
+            self.emitted_len = 0;
+            self.passthrough_current_block = false;
         }
 
         output
@@ -1497,7 +1521,13 @@ impl SseControlBlockFilter {
         }
 
         let block = std::mem::take(&mut self.buffered);
-        if sse_block_has_data_line(&block) {
+        let emitted_len = self.emitted_len.min(block.len());
+        let passthrough_current_block = self.passthrough_current_block;
+        self.emitted_len = 0;
+        self.passthrough_current_block = false;
+        if passthrough_current_block {
+            block[emitted_len..].to_vec()
+        } else if sse_block_has_data_line(&block) {
             block
         } else {
             Vec::new()
@@ -1542,6 +1572,15 @@ fn find_sse_block_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
 
 fn sse_block_has_data_line(block: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(block) else {
+        return true;
+    };
+
+    text.lines()
+        .any(|line| line.trim_start().starts_with("data:"))
+}
+
+fn sse_buffer_has_data_line(buffer: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(buffer) else {
         return true;
     };
 
@@ -4689,6 +4728,61 @@ mod tests {
             text,
             "event: response.created\ndata: {\"type\":\"response.created\"}\n\n"
         );
+    }
+
+    #[tokio::test]
+    async fn sse_body_stream_forwards_data_line_before_block_boundary() {
+        let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+        let mut body_stream = Box::pin(build_sse_body_stream(
+            Vec::new(),
+            rx,
+            true,
+            Duration::from_secs(60),
+        ));
+
+        let keepalive = tokio::time::timeout(Duration::from_millis(50), body_stream.next())
+            .await
+            .expect("initial keepalive should be immediate")
+            .expect("stream should yield initial keepalive")
+            .expect("initial keepalive should be ok");
+        assert_eq!(keepalive.as_ref(), b": aether-keepalive\n\n");
+
+        tx.send(Ok(Bytes::from_static(
+            b"event: response.output_text.delta\n",
+        )))
+        .await
+        .expect("event line should send");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), body_stream.next())
+                .await
+                .is_err(),
+            "event-only partial block should remain buffered"
+        );
+
+        tx.send(Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n",
+        )))
+        .await
+        .expect("data line should send");
+        let data_chunk = tokio::time::timeout(Duration::from_millis(50), body_stream.next())
+            .await
+            .expect("data-bearing block should stream before terminator")
+            .expect("stream should yield data-bearing block")
+            .expect("data-bearing block should be ok");
+        assert_eq!(
+            data_chunk.as_ref(),
+            b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n"
+        );
+
+        tx.send(Ok(Bytes::from_static(b"\n")))
+            .await
+            .expect("terminator should send");
+        let terminator = tokio::time::timeout(Duration::from_millis(50), body_stream.next())
+            .await
+            .expect("terminator should stream")
+            .expect("stream should yield terminator")
+            .expect("terminator should be ok");
+        assert_eq!(terminator.as_ref(), b"\n");
     }
 
     #[tokio::test]
