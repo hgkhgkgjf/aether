@@ -63,7 +63,7 @@ Docker Compose 部署后，可在部署目录直接执行：
 ./update.sh
 ```
 
-`update.sh` 会拉取最新 `app` 镜像并重建 `app` 容器，数据卷、Postgres、Redis 不会被删除。Single Node 部署也可显式指定：
+`update.sh` 会拉取最新 `app` 镜像并重建 `app` 容器，`./datas`、`./logs`、Postgres、Redis 不会被删除。Single Node 部署也可显式指定：
 
 ```bash
 ./update.sh --mode single-node
@@ -71,9 +71,24 @@ Docker Compose 部署后，可在部署目录直接执行：
 
 仓库自带的 Docker Compose 默认把应用日志输出到容器 `stdout/stderr`，直接用 `docker compose logs -f app` 查看，避免正式发布镜像切换到非 root 用户后再被宿主机挂载日志目录的权限问题拖垮启动。如果你确实需要文件日志，再显式设置 `AETHER_LOG_DESTINATION=file|both`，并把一个可写目录挂载到 `/opt/aether/logs`（或同步覆盖 `AETHER_LOG_DIR`）。
 
-管理后台右上角“版本信息”会在检测到新版本时显示“立即更新”。正式发布版支持后台内置更新：点击后会下载对应平台的 GitHub Release 包、强制校验 `SHA256SUMS`、解压到 `/opt/aether/releases/<version>`，再切换 `/opt/aether/current` 并退出进程，交给 Docker restart policy / systemd / launchd 拉起新版本。整个过程不需要挂载 Docker socket，也不需要额外 helper 容器。
+管理后台右上角“版本信息”会检测新版本。Docker Compose 部署只提示版本，实际更新继续执行 `./update.sh`；systemd / launchd / 二进制部署才使用后台自更新，流程是下载对应平台的 GitHub Release 包、强制校验 `SHA256SUMS`、解压到 `/opt/aether/releases/<version>`，再切换 `/opt/aether/current` 并退出进程，交给 systemd / launchd 拉起新版本。
 
 源码或本地构建版本不会启用后台在线更新，请继续使用源码更新流程。Docker Compose 用户如果希望“容器重建后也保持镜像层面的新版本”，仍建议定期运行 `./update.sh` 拉取并重建 app 镜像。服务器访问 GitHub 需要代理时，可设置 `AETHER_UPDATE_PROXY_URL`，也兼容 `UPDATE_PROXY_URL`、`HTTPS_PROXY`、`ALL_PROXY`、`HTTP_PROXY` 以及 `NO_PROXY`。共享出口触发 GitHub API 限流时，可设置只读 `AETHER_UPDATE_GITHUB_TOKEN`，也兼容 `GITHUB_TOKEN` / `GH_TOKEN`。下载总超时默认 600 秒，连续无响应/无数据默认 30 秒，可通过 `AETHER_UPDATE_DOWNLOAD_TIMEOUT_SECS` 和 `AETHER_UPDATE_DOWNLOAD_IDLE_TIMEOUT_SECS` 调整。
+
+旧版 Docker Compose 使用 Docker named volume 存放 Postgres/Redis/MySQL，旧版 Single Node 使用 `./data`。升级到当前 `./datas/*` 布局前，先运行一次迁移脚本：
+
+```bash
+# 先查看将迁移哪些数据
+scripts/migrate-compose-data-layout.sh --dry-run
+
+# 标准 Compose: postgres_data/redis_data/mysql_data -> ./datas/*
+scripts/migrate-compose-data-layout.sh --mode compose --stop-services
+
+# 旧 Single Node: ./data -> ./datas/sqlite
+scripts/migrate-compose-data-layout.sh --mode single-node --stop-services
+```
+
+如果是 `install.sh` 安装到独立 Compose 目录，脚本会被复制为部署目录下的 `./migrate-compose-data-layout.sh`。迁移脚本不会删除旧 volume 或旧 `./data`，确认新版本启动正常后再手动清理。
 
 如果是本地源码构建镜像的部署，继续使用：
 
