@@ -597,42 +597,20 @@
                   >({{ record.rate_multiplier }}x)</span>
                 </span>
               </div>
-              <!-- 故障转移图标（优先显示） -->
-              <svg
+              <Shuffle
                 v-if="record.has_fallback"
-                xmlns="http://www.w3.org/2000/svg"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="2"
-                stroke-linecap="round"
-                stroke-linejoin="round"
+                data-usage-attempt-marker="fallback"
                 class="w-3.5 h-3.5 text-amber-600 dark:text-amber-400 flex-shrink-0"
                 title="此请求发生了 Provider 故障转移"
-              >
-                <path d="m16 3 4 4-4 4" />
-                <path d="M20 7H4" />
-                <path d="m8 21-4-4 4-4" />
-                <path d="M4 17h16" />
-              </svg>
-              <!-- 重试图标（仅在无故障转移时显示） -->
-              <svg
-                v-else-if="record.has_retry"
-                xmlns="http://www.w3.org/2000/svg"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="2"
-                stroke-linecap="round"
-                stroke-linejoin="round"
+                aria-label="发生 Provider 故障转移"
+              />
+              <RefreshCcw
+                v-if="record.has_retry"
+                data-usage-attempt-marker="retry"
                 class="w-3.5 h-3.5 text-blue-600 dark:text-blue-400 flex-shrink-0"
-                title="此请求发生了亲和缓存重试"
-              >
-                <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
-                <path d="M21 21v-5h-5" />
-                <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
-                <path d="M3 3v5h5" />
-              </svg>
+                title="此请求发生了重试"
+                aria-label="发生重试"
+              />
             </div>
           </TableCell>
           <TableCell
@@ -871,7 +849,7 @@ import {
   SortableTableHead,
   TableFilterMenu,
 } from '@/components/ui'
-import { RefreshCcw, Search } from 'lucide-vue-next'
+import { RefreshCcw, Search, Shuffle } from 'lucide-vue-next'
 import { formatTokens, formatCurrency } from '@/utils/format'
 import { getCacheCreationTokens, getCacheReadTokens, getEffectiveInputTokens } from '../token-normalization'
 import {
