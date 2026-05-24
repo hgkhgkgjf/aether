@@ -1,5 +1,8 @@
 use std::collections::{btree_map::Entry, BTreeMap, BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{
+    atomic::{AtomicU64, Ordering as AtomicOrdering},
+    Arc, LazyLock,
+};
 
 use aether_admin::provider::pool as admin_provider_pool_pure;
 use aether_data_contracts::repository::candidate_selection::{
@@ -19,7 +22,8 @@ use aether_pool_core::{
 };
 use aether_provider_pool::ProviderPoolService;
 use aether_routing_core::{RankingOverlay, ResolvedRoutingPolicy};
-use tracing::warn;
+use tokio::sync::Semaphore;
+use tracing::{debug, warn};
 
 use crate::ai_serving::{
     candidate_auth_channel_skip_reason, candidate_common_transport_skip_reason,
@@ -43,8 +47,12 @@ use crate::maintenance::spawn_pool_quota_probe_replenish_for_request;
 use crate::orchestration::LocalExecutionCandidateMetadata;
 
 static LOAD_BALANCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static POOL_SCORE_SCHEDULE_INTEREST_SEMAPHORE: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(POOL_SCORE_SCHEDULE_INTEREST_CONCURRENCY)));
 const POOL_ACTIVE_PROBE_SEALED_SKIP_REASON: &str = "pool_active_probe_sealed";
 const ROUTING_PROFILE_DISALLOWED_KEY_SKIP_REASON: &str = "routing_profile_disallowed_key";
+const POOL_SCORE_SCHEDULE_INTEREST_CONCURRENCY: usize = 4;
+const POOL_SCORE_SCHEDULE_INTEREST_MAX_PER_BATCH: usize = 16;
 
 type PoolCatalogKeyContext = PoolMemberSignals;
 
@@ -621,7 +629,7 @@ impl<'a> PoolKeyCursor<'a> {
             return None;
         }
 
-        self.record_score_schedule_interest(&scores).await;
+        self.spawn_score_schedule_interest_recording(&scores);
 
         let key_ids = scores
             .iter()
@@ -849,60 +857,87 @@ impl<'a> PoolKeyCursor<'a> {
         );
     }
 
-    async fn record_score_schedule_interest(&self, scores: &[StoredPoolMemberScore]) {
-        if scores.is_empty() {
+    fn spawn_score_schedule_interest_recording(&self, scores: &[StoredPoolMemberScore]) {
+        if scores.is_empty() || !self.state.app().data.has_pool_score_writer() {
             return;
         }
-        let scheduled_at = current_unix_ms() / 1000;
-        let mut failed = 0usize;
-        for score in scores {
-            let identity = PoolMemberIdentity {
-                pool_kind: score.pool_kind.clone(),
-                pool_id: score.pool_id.clone(),
-                member_kind: score.member_kind.clone(),
-                member_id: score.member_id.clone(),
-            };
-            let scope = PoolScoreScope {
-                capability: score.capability.clone(),
-                scope_kind: score.scope_kind.clone(),
-                scope_id: score.scope_id.clone(),
-            };
-            let result = self
-                .state
-                .app()
-                .data
-                .record_pool_member_schedule_feedback(PoolMemberScheduleFeedback {
-                    identity,
-                    scope: Some(scope),
-                    scheduled_at,
-                    succeeded: None,
-                    hard_state: None,
-                    score_delta: None,
-                    score_reason_patch: Some(serde_json::json!({
-                        "last_schedule_interest": {
-                            "provider_id": self.group.candidate.provider_id.as_str(),
-                            "endpoint_id": self.group.candidate.endpoint_id.as_str(),
-                            "model_id": self.group.candidate.model_id.as_str()
-                        }
-                    })),
-                })
-                .await;
-            if result.is_err() {
-                failed += 1;
-            }
-        }
-        if failed > 0 {
-            warn!(
-                event_name = "pool_group_score_interest_update_failed",
+
+        let Ok(permit) = POOL_SCORE_SCHEDULE_INTEREST_SEMAPHORE
+            .clone()
+            .try_acquire_owned()
+        else {
+            debug!(
+                event_name = "pool_group_score_interest_dropped",
                 log_type = "event",
                 provider_id = %self.group.candidate.provider_id,
                 endpoint_id = %self.group.candidate.endpoint_id,
                 model_id = %self.group.candidate.model_id,
-                failed_count = failed,
                 score_count = scores.len(),
-                "gateway pool scheduler failed to record some pool score schedule interests"
+                "gateway pool scheduler dropped score schedule interest because the background writer is saturated"
             );
-        }
+            return;
+        };
+
+        let scheduled_at = current_unix_ms() / 1000;
+        let provider_id = self.group.candidate.provider_id.clone();
+        let endpoint_id = self.group.candidate.endpoint_id.clone();
+        let model_id = self.group.candidate.model_id.clone();
+        let score_count = scores.len().min(POOL_SCORE_SCHEDULE_INTEREST_MAX_PER_BATCH);
+        let app = self.state.app().clone();
+        let feedback = scores
+            .iter()
+            .take(POOL_SCORE_SCHEDULE_INTEREST_MAX_PER_BATCH)
+            .map(|score| PoolMemberScheduleFeedback {
+                identity: PoolMemberIdentity {
+                    pool_kind: score.pool_kind.clone(),
+                    pool_id: score.pool_id.clone(),
+                    member_kind: score.member_kind.clone(),
+                    member_id: score.member_id.clone(),
+                },
+                scope: Some(PoolScoreScope {
+                    capability: score.capability.clone(),
+                    scope_kind: score.scope_kind.clone(),
+                    scope_id: score.scope_id.clone(),
+                }),
+                scheduled_at,
+                succeeded: None,
+                hard_state: None,
+                score_delta: None,
+                score_reason_patch: Some(serde_json::json!({
+                    "last_schedule_interest": {
+                        "provider_id": provider_id.as_str(),
+                        "endpoint_id": endpoint_id.as_str(),
+                        "model_id": model_id.as_str()
+                    }
+                })),
+            })
+            .collect::<Vec<_>>();
+
+        tokio::spawn(async move {
+            let _permit = permit;
+            let mut failed = 0usize;
+            for feedback in feedback {
+                let result = app
+                    .data
+                    .record_pool_member_schedule_feedback(feedback)
+                    .await;
+                if result.is_err() {
+                    failed += 1;
+                }
+            }
+            if failed > 0 {
+                warn!(
+                    event_name = "pool_group_score_interest_update_failed",
+                    log_type = "event",
+                    provider_id = %provider_id,
+                    endpoint_id = %endpoint_id,
+                    model_id = %model_id,
+                    failed_count = failed,
+                    score_count,
+                    "gateway pool scheduler failed to record some pool score schedule interests"
+                );
+            }
+        });
     }
 
     async fn build_page_eligible_candidates(
