@@ -46,6 +46,11 @@ const CHATGPT_WEB_SEC_CH_UA: &str =
 const CHATGPT_WEB_BROWSER_PROFILE: &str = "chrome143";
 const CHATGPT_WEB_QUOTA_REFRESH_TIMEOUT_MS: u64 = 30_000;
 const CHATGPT_WEB_QUOTA_REFRESH_PROXY_TIMEOUT_MS: u64 = 60_000;
+const GPT_IMAGE2_TOKEN_MIN_PIXELS: u64 = 655_360;
+const GPT_IMAGE2_TOKEN_MAX_PIXELS: u64 = 8_294_400;
+const GPT_IMAGE2_TOKEN_MAX_EDGE: u64 = 3_840;
+const GPT_IMAGE2_TOKEN_MAX_ASPECT_RATIO: u64 = 3;
+const GPT_IMAGE2_PARTIAL_IMAGE_OUTPUT_TOKENS: u64 = 100;
 
 pub(crate) struct ChatGptWebImageStream {
     pub(crate) frame_stream: BoxStream<'static, Result<Bytes, IoError>>,
@@ -320,6 +325,8 @@ struct ChatGptWebImageRequest {
     size: String,
     ratio: String,
     output_format: String,
+    quality: Option<String>,
+    partial_images: u64,
     images: Vec<String>,
 }
 
@@ -349,6 +356,8 @@ impl ChatGptWebImageRequest {
             size: text("size").unwrap_or_else(|| "1024x1024".to_string()),
             ratio: text("ratio").unwrap_or_else(|| "1:1".to_string()),
             output_format: text("output_format").unwrap_or_else(|| "png".to_string()),
+            quality: text("quality"),
+            partial_images: json_u64(body.get("partial_images")).unwrap_or(0),
             images,
         })
     }
@@ -2115,7 +2124,7 @@ fn chatgpt_web_image_usage(
     report_context: Option<&Value>,
 ) -> (Value, Value) {
     let input_tokens = chatgpt_web_image_input_tokens(request, report_context);
-    let estimated_output_tokens = chatgpt_web_image_output_tokens(image);
+    let estimated_output_tokens = chatgpt_web_image_output_tokens(request, image, report_context);
     let usage = json!({
         "input_tokens": input_tokens,
         "output_tokens": estimated_output_tokens,
@@ -2130,8 +2139,8 @@ fn chatgpt_web_image_usage(
             },
             "output_tokens": estimated_output_tokens,
             "output_tokens_details": {
-                "image_tokens": 0,
-                "text_tokens": estimated_output_tokens
+                "image_tokens": estimated_output_tokens,
+                "text_tokens": 0
             },
             "total_tokens": input_tokens.saturating_add(estimated_output_tokens),
         }
@@ -2147,8 +2156,86 @@ fn chatgpt_web_image_input_tokens(
     estimate_text_tokens(prompt.as_str())
 }
 
-fn chatgpt_web_image_output_tokens(image: &DownloadedImage) -> u64 {
-    estimate_text_tokens(image.b64_json.as_str())
+fn chatgpt_web_image_output_tokens(
+    request: &ChatGptWebImageRequest,
+    image: &DownloadedImage,
+    report_context: Option<&Value>,
+) -> u64 {
+    let quality = chatgpt_web_image_quality(request, report_context);
+    let size = chatgpt_web_image_size(request, image, report_context);
+    let partial_images = chatgpt_web_image_partial_images(request, report_context);
+    let base_tokens = size
+        .map(|(width, height)| gpt_image2_output_tokens(width, height, quality.as_str()))
+        .unwrap_or_else(|| gpt_image2_output_tokens(1024, 1024, quality.as_str()));
+    base_tokens
+        .saturating_add(partial_images.saturating_mul(GPT_IMAGE2_PARTIAL_IMAGE_OUTPUT_TOKENS))
+}
+
+fn chatgpt_web_image_quality(
+    request: &ChatGptWebImageRequest,
+    report_context: Option<&Value>,
+) -> String {
+    let candidate = [
+        chatgpt_web_report_context_image_request_text(report_context, "quality"),
+        chatgpt_web_report_context_original_request_text(report_context, "quality"),
+        request.quality.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|value| !value.is_empty())
+    .unwrap_or_else(|| "medium".to_string());
+    normalize_gpt_image2_quality(candidate.as_str())
+}
+
+fn chatgpt_web_image_size(
+    request: &ChatGptWebImageRequest,
+    image: &DownloadedImage,
+    report_context: Option<&Value>,
+) -> Option<(u64, u64)> {
+    if let Some(candidate) = downloaded_image_dimensions(image)
+        .filter(|(width, height)| gpt_image2_dimensions_are_plausible(*width, *height))
+    {
+        return Some(candidate);
+    }
+
+    let candidates = [
+        chatgpt_web_report_context_image_request_text(report_context, "size")
+            .and_then(|value| parse_gpt_image2_size(value.as_str())),
+        chatgpt_web_report_context_original_request_text(report_context, "size")
+            .and_then(|value| parse_gpt_image2_size(value.as_str())),
+        parse_gpt_image2_size(request.size.as_str()),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        if gpt_image2_dimensions_are_valid(candidate.0, candidate.1) {
+            return Some(candidate);
+        }
+    }
+
+    let ratio = chatgpt_web_image_ratio(request, report_context);
+    Some(chatgpt_web_fallback_size_for_ratio(ratio.as_str()))
+}
+
+fn chatgpt_web_image_partial_images(
+    request: &ChatGptWebImageRequest,
+    report_context: Option<&Value>,
+) -> u64 {
+    chatgpt_web_report_context_image_request_u64(report_context, "partial_images")
+        .or_else(|| {
+            chatgpt_web_report_context_original_request_u64(report_context, "partial_images")
+        })
+        .unwrap_or(request.partial_images)
+}
+
+fn chatgpt_web_image_ratio(
+    request: &ChatGptWebImageRequest,
+    report_context: Option<&Value>,
+) -> String {
+    chatgpt_web_report_context_image_request_text(report_context, "ratio")
+        .or_else(|| chatgpt_web_report_context_original_request_text(report_context, "ratio"))
+        .or_else(|| {
+            chatgpt_web_report_context_original_request_text(report_context, "aspect_ratio")
+        })
+        .unwrap_or_else(|| request.ratio.clone())
 }
 
 fn chatgpt_web_report_context_image_request_text(
@@ -2164,6 +2251,16 @@ fn chatgpt_web_report_context_image_request_text(
         .map(ToOwned::to_owned)
 }
 
+fn chatgpt_web_report_context_image_request_u64(
+    report_context: Option<&Value>,
+    key: &str,
+) -> Option<u64> {
+    report_context
+        .and_then(|value| value.get("image_request"))
+        .and_then(|value| value.get(key))
+        .and_then(|value| json_u64(Some(value)))
+}
+
 fn chatgpt_web_report_context_original_request_text(
     report_context: Option<&Value>,
     key: &str,
@@ -2172,6 +2269,16 @@ fn chatgpt_web_report_context_original_request_text(
     value_text(original.get(key)).or_else(|| {
         chatgpt_web_original_image_tool_value(original, key)
             .and_then(|value| value_text(Some(value)))
+    })
+}
+
+fn chatgpt_web_report_context_original_request_u64(
+    report_context: Option<&Value>,
+    key: &str,
+) -> Option<u64> {
+    let original = report_context?.get("original_request_body")?;
+    json_u64(original.get(key)).or_else(|| {
+        chatgpt_web_original_image_tool_value(original, key).and_then(|value| json_u64(Some(value)))
     })
 }
 
@@ -2206,6 +2313,107 @@ fn value_text(value: Option<&Value>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn downloaded_image_dimensions(image: &DownloadedImage) -> Option<(u64, u64)> {
+    match (image.width, image.height) {
+        (Some(width), Some(height)) if width > 0 && height > 0 => {
+            Some((width as u64, height as u64))
+        }
+        _ => None,
+    }
+}
+
+fn gpt_image2_dimensions_are_plausible(width: u64, height: u64) -> bool {
+    let pixels = width.saturating_mul(height);
+    if !(GPT_IMAGE2_TOKEN_MIN_PIXELS..=GPT_IMAGE2_TOKEN_MAX_PIXELS).contains(&pixels) {
+        return false;
+    }
+    let max_edge = width.max(height);
+    let min_edge = width.min(height);
+    if max_edge > GPT_IMAGE2_TOKEN_MAX_EDGE {
+        return false;
+    }
+    if max_edge > min_edge.saturating_mul(GPT_IMAGE2_TOKEN_MAX_ASPECT_RATIO) {
+        return false;
+    }
+    true
+}
+
+fn gpt_image2_dimensions_are_valid(width: u64, height: u64) -> bool {
+    width % 16 == 0 && height % 16 == 0 && gpt_image2_dimensions_are_plausible(width, height)
+}
+
+fn normalize_gpt_image2_quality(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "low" => "low".to_string(),
+        "medium" | "standard" | "auto" => "medium".to_string(),
+        "high" | "hd" => "high".to_string(),
+        _ => "medium".to_string(),
+    }
+}
+
+fn parse_gpt_image2_size(size: &str) -> Option<(u64, u64)> {
+    let normalized = size.trim().to_ascii_lowercase().replace('×', "x");
+    let (width, height) = normalized.split_once('x')?;
+    let width = width
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)?;
+    let height = height
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)?;
+    Some((width, height))
+}
+
+fn chatgpt_web_fallback_size_for_ratio(ratio: &str) -> (u64, u64) {
+    match ratio.trim() {
+        "3:2" => (1216, 832),
+        "2:3" => (832, 1216),
+        "4:3" => (1152, 864),
+        "3:4" => (864, 1152),
+        "5:4" => (1120, 896),
+        "4:5" => (896, 1120),
+        "16:9" => (1344, 768),
+        "9:16" => (768, 1344),
+        "21:9" => (1536, 640),
+        _ => (1024, 1024),
+    }
+}
+
+// Estimate GPT Image 2 image-token output using the same dimensions and quality
+// drivers as OpenAI's public cost calculator. This intentionally ignores the
+// base64 response length, which is only a transport encoding.
+fn gpt_image2_output_tokens(width: u64, height: u64, quality: &str) -> u64 {
+    let quality_scale = match quality.trim().to_ascii_lowercase().as_str() {
+        "low" => 16u64,
+        "high" => 96u64,
+        _ => 48u64,
+    };
+    let long = width.max(height);
+    let short = width.min(height);
+    let short_scale = round_div_u64(quality_scale.saturating_mul(short), long);
+    let (long_scale, short_scale) = if width >= height {
+        (quality_scale, short_scale)
+    } else {
+        (short_scale, quality_scale)
+    };
+    let latent_pixels = u128::from(long_scale).saturating_mul(u128::from(short_scale));
+    let image_pixels = u128::from(width).saturating_mul(u128::from(height));
+    let numerator =
+        latent_pixels.saturating_mul(u128::from(2_000_000u64).saturating_add(image_pixels));
+    let tokens = (numerator.saturating_add(4_000_000u128 - 1)) / 4_000_000u128;
+    u64::try_from(tokens).unwrap_or(u64::MAX)
+}
+
+fn round_div_u64(numerator: u64, denominator: u64) -> u64 {
+    if denominator == 0 {
+        return 0;
+    }
+    numerator.saturating_add(denominator / 2) / denominator
+}
+
 fn estimate_text_tokens(text: &str) -> u64 {
     let chars = text.chars().count() as u64;
     if chars == 0 {
@@ -2213,6 +2421,23 @@ fn estimate_text_tokens(text: &str) -> u64 {
     } else {
         chars.div_ceil(4).max(1)
     }
+}
+
+fn json_u64(value: Option<&Value>) -> Option<u64> {
+    value.and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| {
+                value
+                    .as_i64()
+                    .and_then(|number| (number >= 0).then_some(number as u64))
+            })
+            .or_else(|| {
+                value
+                    .as_str()
+                    .and_then(|number| number.trim().parse::<u64>().ok())
+            })
+    })
 }
 
 fn build_failed_sse(request: &ChatGptWebImageRequest, failure: &Value) -> String {
@@ -2890,8 +3115,16 @@ mod tests {
     }
 
     #[test]
+    fn gpt_image2_output_token_estimator_matches_pricing_calculator_examples() {
+        assert_eq!(gpt_image2_output_tokens(1024, 1024, "low"), 196);
+        assert_eq!(gpt_image2_output_tokens(1024, 1024, "medium"), 1756);
+        assert_eq!(gpt_image2_output_tokens(1536, 1024, "medium"), 1372);
+        assert_eq!(gpt_image2_output_tokens(1024, 1536, "medium"), 1372);
+        assert_eq!(gpt_image2_output_tokens(1024, 1024, "high"), 7024);
+    }
+
+    #[test]
     fn chatgpt_web_success_sse_includes_estimated_image_usage() {
-        let output_text = "aGVsbG8=".repeat(128);
         let request = ChatGptWebImageRequest {
             model: "gpt-image-2".to_string(),
             web_model: "gpt-5-5-thinking".to_string(),
@@ -2899,10 +3132,12 @@ mod tests {
             size: "1024x1024".to_string(),
             ratio: "1:1".to_string(),
             output_format: "png".to_string(),
+            quality: Some("low".to_string()),
+            partial_images: 0,
             images: Vec::new(),
         };
         let image = DownloadedImage {
-            b64_json: output_text.clone(),
+            b64_json: "aGVsbG8=".repeat(128),
             mime: "image/png".to_string(),
             width: Some(1024),
             height: Some(1024),
@@ -2919,7 +3154,7 @@ mod tests {
         );
         let completed = completed_response_from_sse(body.as_str());
         let input_tokens = estimate_text_tokens("draw a test image");
-        let output_tokens = estimate_text_tokens(output_text.as_str());
+        let output_tokens = 196;
 
         assert_eq!(completed["usage"]["input_tokens"], json!(input_tokens));
         assert_eq!(completed["usage"]["output_tokens"], json!(output_tokens));
@@ -2932,7 +3167,7 @@ mod tests {
             json!(input_tokens)
         );
         assert_eq!(
-            completed["tool_usage"]["image_gen"]["output_tokens_details"]["text_tokens"],
+            completed["tool_usage"]["image_gen"]["output_tokens_details"]["image_tokens"],
             json!(output_tokens)
         );
         assert_eq!(
@@ -2942,8 +3177,7 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_web_success_sse_counts_output_text_not_dimensions() {
-        let output_text = "iVBORw0KGgoAAAANSUhEUgAA".repeat(64);
+    fn chatgpt_web_success_sse_uses_image_dimensions_not_output_text() {
         let request = ChatGptWebImageRequest {
             model: "gpt-image-2".to_string(),
             web_model: "gpt-5-5-thinking".to_string(),
@@ -2951,10 +3185,12 @@ mod tests {
             size: "1024x1024".to_string(),
             ratio: "1:1".to_string(),
             output_format: "png".to_string(),
+            quality: Some("low".to_string()),
+            partial_images: 0,
             images: Vec::new(),
         };
         let image = DownloadedImage {
-            b64_json: output_text.clone(),
+            b64_json: "iVBORw0KGgoAAAANSUhEUgAA".repeat(64),
             mime: "image/png".to_string(),
             width: Some(1402),
             height: Some(1122),
@@ -2973,7 +3209,7 @@ mod tests {
 
         assert_eq!(
             completed["usage"]["output_tokens"],
-            json!(estimate_text_tokens(output_text.as_str()))
+            json!(gpt_image2_output_tokens(1402, 1122, "low"))
         );
     }
 
@@ -3428,16 +3664,12 @@ data: [DONE]
         assert!(body.contains("\"height\":3"));
         let expected_output_text =
             base64::engine::general_purpose::STANDARD.encode(png_header_bytes(2, 3));
-        let expected_output_tokens = estimate_text_tokens(expected_output_text.as_str());
         assert!(body.contains(&expected_output_text));
         let completed = completed_response_from_sse(body.as_str());
-        assert_eq!(
-            completed["usage"]["output_tokens"],
-            json!(expected_output_tokens)
-        );
+        assert_eq!(completed["usage"]["output_tokens"], json!(1756));
         assert_eq!(
             completed["tool_usage"]["image_gen"]["output_tokens"],
-            json!(expected_output_tokens)
+            json!(1756)
         );
 
         handle.abort();
@@ -3503,11 +3735,6 @@ data: [DONE]
         assert!(decoded_data.contains("\"width\":2"));
         assert!(decoded_data.contains("\"height\":3"));
         assert!(text.contains("\"type\":\"eof\""));
-        let expected_output_tokens = estimate_text_tokens(
-            base64::engine::general_purpose::STANDARD
-                .encode(png_header_bytes(2, 3))
-                .as_str(),
-        );
         let eof_frame = text
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -3520,7 +3747,7 @@ data: [DONE]
                 .and_then(|summary| summary.get("standardized_usage"))
                 .and_then(|usage| usage.get("output_tokens"))
                 .and_then(Value::as_i64),
-            i64::try_from(expected_output_tokens).ok()
+            Some(1756)
         );
         assert_eq!(
             eof_frame
