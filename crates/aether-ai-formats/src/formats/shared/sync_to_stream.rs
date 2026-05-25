@@ -20,6 +20,7 @@ use crate::formats::shared::stream_core::common::{
 use crate::formats::shared::stream_core::{
     CanonicalStreamFrame, StreamingStandardFormatMatrix, StreamingStandardTerminalObserver,
 };
+use crate::formats::shared::stream_rewrite::maybe_build_ai_surface_stream_rewriter;
 use crate::formats::shared::AiSurfaceFinalizeError;
 
 pub struct SyncToStreamBridgeOutcome {
@@ -667,17 +668,20 @@ fn maybe_bridge_aether_sse_response_capture_to_stream(
         captured_api_format.as_str(),
         client_api_format,
     );
-    let sse_body =
-        if captured_api_format == client_api_format && captured_api_format != "claude:messages" {
-            body_text.as_bytes().to_vec()
+    let sse_body = if captured_api_format == client_api_format {
+        if captured_api_format == "claude:messages" {
+            sanitize_same_format_claude_sse_body(body_text.as_bytes(), report_context)?
         } else {
-            rewrite_sse_body_between_formats(
-                body_text.as_bytes(),
-                captured_api_format.as_str(),
-                client_api_format,
-                &bridge_context,
-            )?
-        };
+            body_text.as_bytes().to_vec()
+        }
+    } else {
+        rewrite_sse_body_between_formats(
+            body_text.as_bytes(),
+            captured_api_format.as_str(),
+            client_api_format,
+            &bridge_context,
+        )?
+    };
     let terminal_summary = observe_sse_terminal_summary(
         body_text.as_bytes(),
         captured_api_format.as_str(),
@@ -688,6 +692,34 @@ fn maybe_bridge_aether_sse_response_capture_to_stream(
         sse_body,
         terminal_summary,
     }))
+}
+
+fn sanitize_same_format_claude_sse_body(
+    body: &[u8],
+    report_context: Option<&Value>,
+) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
+    let mut context = report_context
+        .cloned()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    let object = context
+        .as_object_mut()
+        .expect("same-format Claude context should stay object");
+    object.insert(
+        "provider_api_format".to_string(),
+        Value::String("claude:messages".to_string()),
+    );
+    object.insert(
+        "client_api_format".to_string(),
+        Value::String("claude:messages".to_string()),
+    );
+
+    let Some(mut rewriter) = maybe_build_ai_surface_stream_rewriter(Some(&context)) else {
+        return Ok(body.to_vec());
+    };
+    let mut out = rewriter.push_chunk(body)?;
+    out.extend(rewriter.finish()?);
+    Ok(out)
 }
 
 fn response_capture_header<'a>(headers: &'a Map<String, Value>, name: &str) -> Option<&'a str> {
@@ -1359,6 +1391,10 @@ mod tests {
             "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_read_1\",\"name\":\"Read\",\"input\":{\"file_path\":\"D:/projects/UIAutoTest/docs/prd/msr.md\",\"offset\":0,\"limit\":2000,\"pages\":\"\"}}}\n\n",
             "event: content_block_stop\n",
             "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srv_1\",\"name\":\"web_search\",\"input\":{\"query\":\"rust\"}}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
             "event: message_delta\n",
             "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n\n",
             "event: message_stop\n",
@@ -1382,7 +1418,10 @@ mod tests {
 
         let output = utf8(outcome.sse_body);
         assert!(output.contains("\"name\":\"Read\""));
-        assert!(output.contains("\\\"limit\\\":2000"));
+        assert!(output.contains("\"limit\":2000"));
+        assert!(output.contains("\"type\":\"server_tool_use\""));
+        assert!(output.contains("\"name\":\"web_search\""));
+        assert!(!output.contains("\"pages\":\"\""));
         assert!(!output.contains("\\\"pages\\\":\\\"\\\""));
     }
 
