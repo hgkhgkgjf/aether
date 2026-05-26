@@ -2398,7 +2398,7 @@ mod tests {
                 format!("http://{addr}/chat"),
                 true,
                 ExecutionTimeouts {
-                    first_byte_ms: Some(50),
+                    first_byte_ms: Some(1_000),
                     total_ms: Some(25),
                     ..ExecutionTimeouts::default()
                 },

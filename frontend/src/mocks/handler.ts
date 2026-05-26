@@ -1796,6 +1796,42 @@ function generateMockModelsForProvider(providerId: string) {
 
 // ========== 注册动态路由 ==========
 
+const WRITE_ONLY_SYSTEM_CONFIG_KEYS = new Set([
+  'module.server_chan_push.send_key',
+  'module.bark_push.device_key',
+  'backup_s3_secret_access_key',
+])
+
+function mockSystemConfigValue(key: string) {
+  return MOCK_SYSTEM_CONFIGS.find(item => item.key === key)?.value
+}
+
+function mockS3BackupConfigValidated() {
+  return [
+    'backup_s3_endpoint',
+    'backup_s3_bucket',
+    'backup_s3_access_key_id',
+    'backup_s3_secret_access_key',
+  ].every(key => {
+    const value = mockSystemConfigValue(key)
+    return typeof value === 'string' && value.trim() !== ''
+  })
+}
+
+function refreshMockS3BackupModuleStatus() {
+  const moduleStatus = MOCK_MODULE_STATUSES.s3_backup
+  if (!moduleStatus) return
+  const enabled = mockSystemConfigValue('backup_s3_enabled') === true
+  const configValidated = mockS3BackupConfigValidated()
+  MOCK_MODULE_STATUSES.s3_backup = {
+    ...moduleStatus,
+    enabled,
+    config_validated: configValidated,
+    config_error: configValidated ? null : '请先完成 S3 备份配置',
+    active: moduleStatus.available && enabled && configValidated,
+  }
+}
+
 // 系统配置详情
 registerDynamicRoute('GET', '/api/admin/system/configs/:configKey', async (_config, params) => {
   await delay()
@@ -1805,7 +1841,7 @@ registerDynamicRoute('GET', '/api/admin/system/configs/:configKey', async (_conf
   if (!entry) {
     throw { response: createMockResponse({ detail: `配置项 '${key}' 不存在` }, 404) }
   }
-  if (key === 'module.server_chan_push.send_key' || key === 'module.bark_push.device_key') {
+  if (WRITE_ONLY_SYSTEM_CONFIG_KEYS.has(key)) {
     return createMockResponse({
       key: entry.key,
       value: null,
@@ -1836,7 +1872,24 @@ registerDynamicRoute('PUT', '/api/admin/system/configs/:configKey', async (confi
       ...entry,
     }
   }
+  if (key.startsWith('backup_s3_')) {
+    refreshMockS3BackupModuleStatus()
+  }
   return createMockResponse(entry)
+})
+
+registerDynamicRoute('POST', '/api/admin/system/backups/s3/run', async () => {
+  await delay()
+  requireAdmin()
+  return createMockResponse({
+    message: 'S3 备份任务已提交',
+    task: {
+      id: `mock-s3-backup-${Date.now()}`,
+      task_key: 'system.s3.backup',
+      status: 'queued',
+      progress_message: 'S3 备份任务已提交',
+    },
+  })
 })
 
 // 模块状态详情
@@ -1860,6 +1913,21 @@ registerDynamicRoute('PUT', '/api/admin/modules/status/:moduleName/enabled', asy
   }
   const body = JSON.parse(config.data || '{}') as { enabled?: boolean }
   const enabled = body.enabled === true
+  if (params.moduleName === 's3_backup') {
+    const index = MOCK_SYSTEM_CONFIGS.findIndex(item => item.key === 'backup_s3_enabled')
+    const entry = {
+      key: 'backup_s3_enabled',
+      value: enabled,
+      description: 'S3 自动备份开关',
+    }
+    if (index === -1) {
+      MOCK_SYSTEM_CONFIGS.push(entry)
+    } else {
+      MOCK_SYSTEM_CONFIGS[index] = { ...MOCK_SYSTEM_CONFIGS[index], ...entry }
+    }
+    refreshMockS3BackupModuleStatus()
+    return createMockResponse(MOCK_MODULE_STATUSES.s3_backup)
+  }
   const updated = {
     ...moduleStatus,
     enabled,

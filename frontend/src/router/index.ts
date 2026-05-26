@@ -275,6 +275,12 @@ const routes: RouteRecordRaw[] = [
         meta: { module: 'chat_pii_redaction' }
       },
       {
+        path: 'modules/s3-backup',
+        name: 'S3BackupSettings',
+        component: () => importWithRetry(() => import('@/views/admin/modules/S3BackupSettings.vue')),
+        meta: { module: 's3_backup' }
+      },
+      {
         path: 'modules/important-notification',
         redirect: '/admin/notification-service'
       },

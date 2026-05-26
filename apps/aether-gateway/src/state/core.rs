@@ -1268,6 +1268,10 @@ impl AppState {
             crate::task_runtime::TASK_KEY_VIDEO_TASK_POLLER,
             spawn_video_task_poller(self.clone()),
         );
+        supervise_worker(
+            crate::backup::worker::S3_BACKUP_WORKER_TASK_KEY,
+            crate::backup::worker::spawn_s3_backup_worker(self.clone()),
+        );
 
         supervisor
     }

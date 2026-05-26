@@ -897,6 +897,15 @@ async fn gateway_handles_admin_modules_status_locally_with_trusted_admin_princip
     );
     assert_eq!(payload["bark_push"]["display_name"], "Bark 推送");
     assert_eq!(payload["bark_push"]["admin_route"], "/admin/modules/bark");
+    assert_eq!(payload["s3_backup"]["display_name"], "S3 备份");
+    assert_eq!(
+        payload["s3_backup"]["admin_route"],
+        "/admin/modules/s3-backup"
+    );
+    assert_eq!(
+        payload["s3_backup"]["admin_menu_group"],
+        serde_json::Value::Null
+    );
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
