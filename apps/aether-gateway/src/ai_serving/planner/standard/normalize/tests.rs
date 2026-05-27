@@ -396,7 +396,7 @@ fn injects_codex_prompt_cache_key_for_openai_responses_cross_format_requests() {
 
     assert_eq!(
         provider_request_body["prompt_cache_key"],
-        "b4dfeb75-b105-544c-a706-39b92f0bddb0"
+        "4ee6ea6e-3ac6-5a18-8cb8-1f8b956419e5"
     );
 }
 
