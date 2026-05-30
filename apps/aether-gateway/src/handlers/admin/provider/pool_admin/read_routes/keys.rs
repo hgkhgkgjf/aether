@@ -11,6 +11,7 @@ use crate::ai_serving::{provider_key_pool_score_id, provider_key_pool_score_scop
 use crate::handlers::admin::provider::shared::support::AdminProviderPoolConfig;
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::handlers::admin::shared::provider_key_status_snapshot_payload;
+use crate::provider_key_auth::provider_key_auth_semantics;
 use crate::GatewayError;
 use aether_admin::provider::pool as admin_provider_pool_pure;
 use aether_data_contracts::repository::pool_scores::{
@@ -336,7 +337,11 @@ fn admin_pool_label_status_filter(label: &str) -> Option<&'static str> {
 }
 
 fn admin_pool_oauth_status_filter(
+    key: &StoredProviderCatalogKey,
+    provider_type: &str,
+    auth_config: Option<&serde_json::Map<String, Value>>,
     oauth_snapshot: Option<&serde_json::Map<String, Value>>,
+    now_unix_secs: u64,
 ) -> Option<&'static str> {
     let oauth_snapshot = oauth_snapshot?;
     let code = admin_pool_trimmed_string(oauth_snapshot.get("code"))
@@ -347,8 +352,36 @@ fn admin_pool_oauth_status_filter(
         "expired" => Some("expired"),
         _ => admin_pool_trimmed_string(oauth_snapshot.get("label"))
             .as_deref()
-            .and_then(admin_pool_label_status_filter),
+            .and_then(admin_pool_label_status_filter)
+            .or_else(|| {
+                admin_pool_derive_oauth_expires_at(provider_type, key, auth_config)
+                    .is_some_and(|expires_at| expires_at <= now_unix_secs)
+                    .then_some("expired")
+            }),
     }
+}
+
+fn admin_pool_derive_oauth_expires_at(
+    provider_type: &str,
+    key: &StoredProviderCatalogKey,
+    auth_config: Option<&serde_json::Map<String, Value>>,
+) -> Option<u64> {
+    if !provider_key_auth_semantics(key, provider_type).oauth_managed() {
+        return None;
+    }
+
+    if key.expires_at_unix_secs.is_some() {
+        return key.expires_at_unix_secs;
+    }
+
+    for field in ["expires_at", "expiresAt", "expiry", "exp"] {
+        let expires_at = admin_pool_json_u64(auth_config.and_then(|config| config.get(field)));
+        if expires_at.is_some() {
+            return expires_at;
+        }
+    }
+
+    None
 }
 
 fn admin_pool_account_status_filter(
@@ -413,15 +446,18 @@ fn admin_pool_key_cost_exhausted(
 }
 
 fn admin_pool_key_visible_status_filter(
+    state: &AdminAppState<'_>,
     key: &StoredProviderCatalogKey,
     provider_type: &str,
     pool_config: Option<&AdminProviderPoolConfig>,
     runtime: &AdminProviderPoolRuntimeState,
+    now_unix_secs: u64,
 ) -> &'static str {
     let status_snapshot = provider_key_status_snapshot_payload(key, provider_type);
     let account_snapshot = status_snapshot.get("account").and_then(Value::as_object);
     let quota_snapshot = status_snapshot.get("quota").and_then(Value::as_object);
     let oauth_snapshot = status_snapshot.get("oauth").and_then(Value::as_object);
+    let auth_config = state.parse_catalog_auth_config_json(key);
 
     if let Some(status) = admin_pool_account_status_filter(account_snapshot) {
         return status;
@@ -429,7 +465,13 @@ fn admin_pool_key_visible_status_filter(
     if let Some(status) = admin_pool_quota_status_filter(quota_snapshot) {
         return status;
     }
-    if let Some(status) = admin_pool_oauth_status_filter(oauth_snapshot) {
+    if let Some(status) = admin_pool_oauth_status_filter(
+        key,
+        provider_type,
+        auth_config.as_ref(),
+        oauth_snapshot,
+        now_unix_secs,
+    ) {
         return status;
     }
     if pool_config.is_some_and(|config| config.skip_exhausted_accounts)
@@ -523,6 +565,7 @@ pub(super) async fn build_admin_pool_list_keys_response(
     let pool_config = admin_provider_pool_config(&provider);
     let page_offset = page.saturating_sub(1).saturating_mul(page_size);
     let sort_by_score = matches!(sort.field, AdminPoolKeySortField::Score);
+    let now_unix_secs = admin_pool_current_unix_secs();
 
     let (keys, total, preloaded_pool_scores_by_key_id) = if status != "all" {
         let mut keys = state
@@ -569,10 +612,12 @@ pub(super) async fn build_admin_pool_list_keys_response(
         };
         keys.retain(|key| {
             admin_pool_key_visible_status_filter(
+                state,
                 key,
                 &provider.provider_type,
                 pool_config.as_ref(),
                 &runtime,
+                now_unix_secs,
             ) == status
         });
 
@@ -673,7 +718,6 @@ pub(super) async fn build_admin_pool_list_keys_response(
         }
         _ => AdminProviderPoolRuntimeState::default(),
     };
-    let now_unix_secs = admin_pool_current_unix_secs();
     let codex_cycle_usage_by_key = read_admin_pool_codex_cycle_usage_by_key(
         state,
         &provider.provider_type,
@@ -706,4 +750,77 @@ pub(super) async fn build_admin_pool_list_keys_response(
         "keys": items,
     }))
     .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sample_key(auth_type: &str) -> StoredProviderCatalogKey {
+        StoredProviderCatalogKey::new(
+            "key-1".to_string(),
+            "provider-codex".to_string(),
+            "Codex OAuth".to_string(),
+            auth_type.to_string(),
+            None,
+            true,
+        )
+        .expect("sample key should build")
+    }
+
+    #[test]
+    fn oauth_status_filter_uses_auth_config_expiry_for_visible_expired_state() {
+        let key = sample_key("oauth");
+        let oauth_snapshot_value = json!({"code": "none", "label": null});
+        let auth_config_value = json!({"expires_at": 1_000u64});
+
+        assert_eq!(
+            admin_pool_oauth_status_filter(
+                &key,
+                "codex",
+                auth_config_value.as_object(),
+                oauth_snapshot_value.as_object(),
+                2_000,
+            ),
+            Some("expired")
+        );
+    }
+
+    #[test]
+    fn oauth_status_filter_prefers_catalog_key_expiry_over_auth_config_expiry() {
+        let mut key = sample_key("oauth");
+        key.expires_at_unix_secs = Some(3_000);
+        let oauth_snapshot_value = json!({"code": "none", "label": null});
+        let auth_config_value = json!({"expires_at": 1_000u64});
+
+        assert_eq!(
+            admin_pool_oauth_status_filter(
+                &key,
+                "codex",
+                auth_config_value.as_object(),
+                oauth_snapshot_value.as_object(),
+                2_000,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn oauth_status_filter_ignores_auth_config_expiry_for_non_oauth_keys() {
+        let key = sample_key("api_key");
+        let oauth_snapshot_value = json!({"code": "none", "label": null});
+        let auth_config_value = json!({"expires_at": 1_000u64});
+
+        assert_eq!(
+            admin_pool_oauth_status_filter(
+                &key,
+                "codex",
+                auth_config_value.as_object(),
+                oauth_snapshot_value.as_object(),
+                2_000,
+            ),
+            None
+        );
+    }
 }
