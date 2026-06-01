@@ -21,7 +21,7 @@
       </div>
 
       <div
-        v-else-if="monitors.length === 0"
+        v-else-if="visibleMonitors.length === 0"
         class="flex flex-col items-center justify-center py-12 text-muted-foreground"
       >
         <Activity class="w-12 h-12 mb-3 opacity-30" />
@@ -36,7 +36,7 @@
         class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4"
       >
         <div
-          v-for="(monitor, index) in monitors"
+          v-for="(monitor, index) in visibleMonitors"
           :key="`${monitor.api_format}-${index}`"
           class="relative overflow-hidden rounded-xl border border-border/60 bg-card/60 p-4 transition-colors hover:border-primary/50"
         >
@@ -54,12 +54,6 @@
                 <h4 class="truncate text-sm font-semibold">
                   {{ formatApiFormat(monitor.api_format) }}
                 </h4>
-                <Badge
-                  variant="outline"
-                  class="mt-1 max-w-full font-mono text-[11px]"
-                >
-                  <span class="truncate">{{ monitor.api_format }}</span>
-                </Badge>
               </div>
             </div>
             <Badge
@@ -101,7 +95,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, watch } from 'vue'
+import { computed, ref, onMounted, watch } from 'vue'
 import { Activity, Loader2 } from 'lucide-vue-next'
 import Card from '@/components/ui/card.vue'
 import Badge from '@/components/ui/badge.vue'
@@ -137,6 +131,7 @@ const loading = ref(false)
 const loadingMonitors = ref(false)
 const monitors = ref<EndpointMonitor[]>([])
 const lookbackHours = ref('6')
+const visibleMonitors = computed(() => monitors.value.filter(monitor => monitor.total_attempts > 0))
 
 async function loadMonitors() {
   loadingMonitors.value = true
