@@ -13,6 +13,7 @@ pub(crate) const OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE: &str = "openai_cli
 const AETHER_EXTENSION_NAMESPACE: &str = "aether";
 const CLAUDE_TOOL_RESULT_SOURCE_MARKER: &str = "claude_tool_result";
 const OPENAI_CHAT_TOOL_RESULT_SOURCE_MARKER: &str = "openai_chat_tool_result";
+const OPENAI_RESPONSES_TOOL_RESULT_SOURCE_MARKER: &str = "openai_responses_tool_result";
 const OPENAI_CHAT_TOOL_ERROR_PREFIX: &str = "[tool error]";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1644,6 +1645,21 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                             });
                         let raw_output = item_object.get("output");
                         let output = Some(parse_jsonish_value(raw_output));
+                        let mut extensions = openai_responses_extensions(
+                            item_object,
+                            &[
+                                "type",
+                                "call_id",
+                                "tool_call_id",
+                                "id",
+                                "output",
+                                "is_error",
+                            ],
+                        );
+                        extensions.insert(
+                            AETHER_EXTENSION_NAMESPACE.to_string(),
+                            json!({ "source": OPENAI_RESPONSES_TOOL_RESULT_SOURCE_MARKER }),
+                        );
                         messages.push(CanonicalMessage {
                             role: CanonicalRole::Tool,
                             content: vec![CanonicalContentBlock::ToolResult {
@@ -1655,17 +1671,7 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                                     .get("is_error")
                                     .and_then(Value::as_bool)
                                     .unwrap_or(false),
-                                extensions: openai_responses_extensions(
-                                    item_object,
-                                    &[
-                                        "type",
-                                        "call_id",
-                                        "tool_call_id",
-                                        "id",
-                                        "output",
-                                        "is_error",
-                                    ],
-                                ),
+                                extensions,
                             }],
                             extensions: BTreeMap::new(),
                         });
@@ -1836,6 +1842,21 @@ pub(crate) fn openai_responses_output_to_canonical_blocks(
                     .unwrap_or_else(|| format!("call_auto_{index}"));
                 let raw_output = item_object.get("output");
                 let output = Some(parse_jsonish_value(raw_output));
+                let mut extensions = openai_responses_extensions(
+                    item_object,
+                    &[
+                        "type",
+                        "id",
+                        "call_id",
+                        "tool_call_id",
+                        "output",
+                        "is_error",
+                    ],
+                );
+                extensions.insert(
+                    AETHER_EXTENSION_NAMESPACE.to_string(),
+                    json!({ "source": OPENAI_RESPONSES_TOOL_RESULT_SOURCE_MARKER }),
+                );
                 blocks.push(CanonicalContentBlock::ToolResult {
                     tool_use_id: id,
                     name: None,
@@ -1845,17 +1866,7 @@ pub(crate) fn openai_responses_output_to_canonical_blocks(
                         .get("is_error")
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
-                    extensions: openai_responses_extensions(
-                        item_object,
-                        &[
-                            "type",
-                            "id",
-                            "call_id",
-                            "tool_call_id",
-                            "output",
-                            "is_error",
-                        ],
-                    ),
+                    extensions,
                 });
             }
             "image_generation_call" => {
@@ -2381,11 +2392,7 @@ fn canonical_message_blocks_to_openai_chat(
     output.insert(
         "content".to_string(),
         if !tool_calls.is_empty() && content_parts.is_empty() {
-            if reasoning_parts.is_empty() {
-                Value::Array(Vec::new())
-            } else {
-                Value::Null
-            }
+            Value::Null
         } else {
             openai_content_value_from_parts(content_parts, false)
         },
@@ -2432,6 +2439,11 @@ fn canonical_tool_result_to_openai_chat(block: &CanonicalContentBlock) -> Value 
         } else {
             content
         }
+    } else if is_openai_responses_tool_result(extensions) {
+        openai_responses_tool_result_content_for_chat(
+            result_output.as_ref(),
+            content_text.as_deref(),
+        )
     } else {
         result_output
             .clone()
@@ -2447,6 +2459,28 @@ fn is_claude_tool_result(extensions: &BTreeMap<String, Value>) -> bool {
         .and_then(|value| value.get("source"))
         .and_then(Value::as_str)
         == Some(CLAUDE_TOOL_RESULT_SOURCE_MARKER)
+}
+
+fn is_openai_responses_tool_result(extensions: &BTreeMap<String, Value>) -> bool {
+    extensions
+        .get(AETHER_EXTENSION_NAMESPACE)
+        .and_then(|value| value.get("source"))
+        .and_then(Value::as_str)
+        == Some(OPENAI_RESPONSES_TOOL_RESULT_SOURCE_MARKER)
+}
+
+fn openai_responses_tool_result_content_for_chat(
+    output: Option<&Value>,
+    content_text: Option<&str>,
+) -> Value {
+    if let Some(text) = content_text {
+        return Value::String(text.to_string());
+    }
+    match output {
+        Some(Value::String(text)) => Value::String(text.clone()),
+        Some(value) => Value::String(value.to_string()),
+        None => Value::String(String::new()),
+    }
 }
 
 fn openai_chat_tool_result_content(output: Option<&Value>, content_text: Option<&str>) -> Value {

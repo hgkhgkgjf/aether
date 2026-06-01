@@ -163,6 +163,7 @@ mod tests {
         convert_openai_chat_request_to_claude_request,
         convert_openai_chat_request_to_openai_responses_request,
         normalize_claude_request_to_openai_chat_request,
+        normalize_openai_responses_request_to_openai_chat_request,
     };
 
     #[test]
@@ -214,6 +215,64 @@ mod tests {
         assert_eq!(converted["model"], "claude-sonnet");
         assert_eq!(converted["messages"][0]["role"], "user");
         assert_eq!(converted["messages"][0]["content"], "hello");
+    }
+
+    #[test]
+    fn responses_request_normalizer_keeps_tool_history_chat_safe() {
+        let call_id = "call_weather_123";
+        let tool_output = json!({
+            "toolCallId": call_id,
+            "input": {"city": "Hangzhou"},
+            "output": {
+                "content": [{"type": "text", "text": "sunny"}],
+                "isError": false,
+            },
+        });
+        let body = json!({
+            "model": "glm-5.1",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "weather now"}]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "id": call_id,
+                    "name": "mcp__mapsWeather",
+                    "arguments": "{\"city\":\"Hangzhou\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": tool_output.to_string()
+                }
+            ]
+        });
+
+        let converted = normalize_openai_responses_request_to_openai_chat_request(&body)
+            .expect("openai chat request");
+        let messages = converted["messages"].as_array().expect("messages");
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "weather now");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert!(messages[1]["content"].is_null());
+        assert_eq!(messages[1]["tool_calls"][0]["id"], call_id);
+        assert_eq!(
+            messages[1]["tool_calls"][0]["function"]["name"],
+            "mcp__mapsWeather"
+        );
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], call_id);
+        let content = messages[2]["content"]
+            .as_str()
+            .expect("tool result content should stay a string");
+        assert_eq!(
+            serde_json::from_str::<Value>(content).expect("tool output json"),
+            tool_output
+        );
     }
 
     #[test]
