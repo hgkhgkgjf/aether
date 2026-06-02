@@ -146,6 +146,7 @@ pub struct SyncTerminalUsagePayloadSeed {
     pub provider_response_body_state: Option<UsageBodyCaptureState>,
     pub client_response: Option<Value>,
     pub client_response_body_state: Option<UsageBodyCaptureState>,
+    pub standardized_usage: Option<StandardizedUsage>,
     pub capture_metadata: Option<Value>,
 }
 
@@ -766,6 +767,7 @@ pub fn build_sync_terminal_usage_payload_seed(
         .or_else(|| headers_to_json(&payload.headers));
     let client_response_headers = context_usage_value(context, "client_response_headers")
         .or_else(|| headers_to_json(&payload.headers));
+    let standardized_usage = kiro_simulated_cache_standardized_usage_from_context(context);
     SyncTerminalUsagePayloadSeed {
         report_kind: payload.report_kind.clone(),
         status_code: payload.status_code,
@@ -780,6 +782,7 @@ pub fn build_sync_terminal_usage_payload_seed(
         provider_response_body_state,
         client_response,
         client_response_body_state,
+        standardized_usage,
         capture_metadata: build_payload_body_capture_metadata(
             payload.body_base64.as_deref(),
             None,
@@ -856,11 +859,14 @@ pub fn build_sync_terminal_usage_seed(
         provider_response_body_state,
         client_response,
         client_response_body_state,
+        standardized_usage,
         capture_metadata,
     } = payload_seed;
-    let standardized_usage = provider_response_full
+    let derived_standardized_usage = provider_response_full
         .as_ref()
         .map(|response| map_usage_from_response(response, context_seed.provider_contract.as_str()));
+    let standardized_usage =
+        merge_standardized_usage_with_context_cache(standardized_usage, derived_standardized_usage);
     let terminal_state = infer_sync_terminal_state(
         report_kind.as_str(),
         status_code,
@@ -912,6 +918,25 @@ pub fn build_sync_terminal_usage_seed(
         audit_payload: capture_metadata,
         standardized_usage,
     }
+}
+
+fn merge_standardized_usage_with_context_cache(
+    context_usage: Option<StandardizedUsage>,
+    derived_usage: Option<StandardizedUsage>,
+) -> Option<StandardizedUsage> {
+    let Some(context_usage) = context_usage else {
+        return derived_usage;
+    };
+
+    let mut usage = derived_usage.unwrap_or_default();
+    usage.input_tokens = context_usage.input_tokens;
+    if context_usage.cache_creation_tokens > 0 {
+        usage.cache_creation_tokens = context_usage.cache_creation_tokens;
+    }
+    if context_usage.cache_read_tokens > 0 {
+        usage.cache_read_tokens = context_usage.cache_read_tokens;
+    }
+    Some(usage)
 }
 
 pub fn build_stream_terminal_usage_seed(
@@ -1758,6 +1783,31 @@ fn context_body_value(context: Option<&Map<String, Value>>, key: &str) -> Option
         Some(Value::Null) | None => None,
         Some(value) => clone_usage_body_value(Some(value)),
     }
+}
+
+fn kiro_simulated_cache_standardized_usage_from_context(
+    context: Option<&Map<String, Value>>,
+) -> Option<StandardizedUsage> {
+    let enabled = context_bool(context, "kiro_simulated_cache_enabled").unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+
+    let input_tokens = context_u64(context, "input_tokens")?;
+    let cache_creation_tokens = context_u64(context, "cache_creation_input_tokens").unwrap_or(0);
+    let cache_read_tokens = context_u64(context, "cache_read_input_tokens").unwrap_or(0);
+    if cache_creation_tokens == 0 && cache_read_tokens == 0 {
+        return None;
+    }
+
+    let billed_input_tokens = input_tokens
+        .saturating_sub(cache_creation_tokens)
+        .saturating_sub(cache_read_tokens);
+    let mut usage = StandardizedUsage::new();
+    usage.input_tokens = billed_input_tokens as i64;
+    usage.cache_creation_tokens = cache_creation_tokens as i64;
+    usage.cache_read_tokens = cache_read_tokens as i64;
+    Some(usage)
 }
 
 fn context_has_inline_body(context: Option<&Map<String, Value>>, key: &str) -> bool {
@@ -5541,6 +5591,64 @@ mod tests {
                 "input": [{"role": "user", "content": "provider-side compiled body"}],
             }))
         );
+    }
+
+    #[test]
+    fn sync_terminal_usage_applies_kiro_simulated_cache_context() {
+        let plan = ExecutionPlan {
+            request_id: "req-sync-kiro-cache-context-1".to_string(),
+            candidate_id: Some("cand-sync-kiro-cache-context-1".to_string()),
+            provider_name: Some("Kiro".to_string()),
+            provider_id: "provider-kiro-1".to_string(),
+            endpoint_id: "endpoint-kiro-1".to_string(),
+            key_id: "key-kiro-1".to_string(),
+            method: "POST".to_string(),
+            url: "https://kiro.example/generateAssistantResponse".to_string(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({
+                "model": "claude-sonnet-4",
+                "messages": [{"role": "user", "content": "hello kiro"}],
+            })),
+            stream: false,
+            client_api_format: "claude:messages".to_string(),
+            provider_api_format: "claude:messages".to_string(),
+            model_name: Some("claude-sonnet-4".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let payload = GatewaySyncReportRequest {
+            trace_id: "trace-sync-kiro-cache-context-1".to_string(),
+            report_kind: "claude_cli_sync_success".to_string(),
+            report_context: Some(json!({
+                "client_api_format": "claude:messages",
+                "provider_api_format": "claude:messages",
+                "provider_name": "Kiro",
+                "model": "claude-sonnet-4",
+                "input_tokens": 1800,
+                "kiro_simulated_cache_enabled": true,
+                "cache_creation_input_tokens": 1200,
+                "cache_read_input_tokens": 300,
+            })),
+            status_code: 200,
+            headers: BTreeMap::new(),
+            body_json: Some(json!({"id": "kiro-sync-response-1"})),
+            client_body_json: None,
+            body_base64: None,
+            telemetry: None,
+        };
+
+        let event =
+            build_sync_terminal_usage_event(&plan, payload.report_context.as_ref(), &payload)
+                .expect("usage event should build");
+
+        assert_eq!(event.event_type, UsageEventType::Completed);
+        assert_eq!(event.data.input_tokens, Some(300));
+        assert_eq!(event.data.cache_creation_input_tokens, Some(1200));
+        assert_eq!(event.data.cache_read_input_tokens, Some(300));
+        assert_eq!(event.data.total_tokens, Some(300));
     }
 
     #[test]
