@@ -2117,8 +2117,10 @@ async fn execute_execution_runtime_sync_impl(
     let mut report_context =
         attach_provider_response_headers_to_report_context(report_context, &headers);
     if (200..300).contains(&status_code) {
-        seed_kiro_sync_report_context_input_tokens(&plan, &mut report_context);
         seed_kiro_sync_simulated_cache_enabled(state, &plan, &mut report_context).await;
+        if kiro_simulated_cache_enabled_from_report_context(report_context.as_ref()) {
+            seed_kiro_sync_report_context_input_tokens(&plan, &mut report_context);
+        }
         seed_kiro_sync_report_context_prompt_cache_usage(state, &plan, &mut report_context).await;
     }
     let mut client_headers = headers.clone();

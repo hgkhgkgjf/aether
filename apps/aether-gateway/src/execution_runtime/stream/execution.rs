@@ -841,7 +841,6 @@ pub(crate) async fn execute_execution_runtime_stream(
 ) -> Result<Option<Response<Body>>, GatewayError> {
     let stream_started_at = Instant::now();
     ensure_execution_request_candidate_slot(state, &mut plan, &mut report_context).await;
-    seed_kiro_report_context_input_tokens(&plan, &mut report_context);
     let lifecycle_seed = build_lifecycle_usage_seed(&plan, report_context.as_ref());
     let request_candidate_status_snapshot =
         snapshot_local_request_candidate_status(&plan, report_context.as_ref());
@@ -1991,9 +1990,11 @@ async fn execute_stream_from_frame_stream(
     };
     let mut report_context =
         attach_provider_response_headers_to_report_context(report_context, &headers);
-    seed_kiro_report_context_input_tokens(&plan, &mut report_context);
     if status_code == 200 {
         seed_kiro_simulated_cache_enabled(state, &plan, &mut report_context).await;
+        if kiro_simulated_cache_enabled_from_report_context(report_context.as_ref()) {
+            seed_kiro_report_context_input_tokens(&plan, &mut report_context);
+        }
         seed_kiro_report_context_prompt_cache_usage(state, &plan, &mut report_context).await;
     }
     let mut buffered_frames = VecDeque::new();
