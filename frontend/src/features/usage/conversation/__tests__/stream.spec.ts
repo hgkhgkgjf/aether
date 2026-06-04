@@ -243,6 +243,45 @@ describe('Conversation stream compatibility', () => {
     })
   })
 
+  it('keeps streamed function_call arguments when response.completed omits them', () => {
+    const requestBody = {
+      model: 'gpt-5.5',
+      stream: true,
+      input: 'What is the weather?',
+    }
+    const rawSse = [
+      'event: response.created',
+      `data: ${JSON.stringify({ type: 'response.created', response: { id: 'resp_fc_1', object: 'response', model: 'gpt-5.5', status: 'in_progress' } })}`,
+      '',
+      'event: response.output_item.added',
+      `data: ${JSON.stringify({ type: 'response.output_item.added', output_index: 0, item: { id: 'fc_1', type: 'function_call', status: 'in_progress', call_id: 'call_1', name: 'get_weather', arguments: '' } })}`,
+      '',
+      'event: response.function_call_arguments.delta',
+      `data: ${JSON.stringify({ type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"city":' })}`,
+      '',
+      'event: response.function_call_arguments.delta',
+      `data: ${JSON.stringify({ type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '"SF"}' })}`,
+      '',
+      // 最终项故意不带 arguments：解析器不应用 '{}' 冲掉已收集的增量参数
+      'event: response.completed',
+      `data: ${JSON.stringify({ type: 'response.completed', response: { id: 'resp_fc_1', object: 'response', model: 'gpt-5.5', status: 'completed', output: [{ id: 'fc_1', type: 'function_call', status: 'completed', call_id: 'call_1', name: 'get_weather' }] } })}`,
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n')
+
+    const parsed = parseResponse(rawSse, requestBody, 'openai:responses')
+    // 命中同一 key，不重复渲染
+    expect(parsed.messages).toHaveLength(1)
+    expect(parsed.messages[0]?.content).toHaveLength(1)
+    expect(parsed.messages[0]?.content[0]).toMatchObject({
+      type: 'tool_use',
+      toolName: 'get_weather',
+      toolId: 'call_1',
+      input: '{"city":"SF"}',
+    })
+  })
+
   it('renders HTML-entity encoded OpenAI tool arguments as formatted JSON', () => {
     const requestBody = {
       model: 'gpt-5.4',

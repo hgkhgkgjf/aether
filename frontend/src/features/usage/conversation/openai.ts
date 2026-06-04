@@ -698,8 +698,9 @@ export class OpenAIParser implements ApiFormatParser {
 
           // 从 output 中提取文本和工具调用（备用方案）
           if (Array.isArray(response?.output)) {
-            for (const rawItem of response.output as unknown[]) {
-              const item = rawItem as RawObject
+            const output = response.output as unknown[]
+            for (let index = 0; index < output.length; index++) {
+              const item = output[index] as RawObject
               if (textParts.length === 0 && item?.type === 'message' && Array.isArray(item?.content)) {
                 for (const rawContent of item.content as unknown[]) {
                   const content = rawContent as RawObject
@@ -710,12 +711,14 @@ export class OpenAIParser implements ApiFormatParser {
               } else if (this.isResponsesCallItemType(item.type)) {
                 const itemId = typeof item.id === 'string' ? item.id : ''
                 const toolId = this.responsesCallId(item)
-                ensureToolCall(
-                  itemId || toolId,
-                  toolId,
-                  this.responsesCallName(item),
-                  this.responsesCallInput(item)
-                )
+                // 与流式阶段使用同一套 key 命中同一条工具调用，避免重复渲染
+                const key = itemId || toolId || outputIndexToToolKey.get(index) || String(index)
+                // 仅在最终项确实带有输入时才覆盖，避免用 '{}' 等默认值
+                // 冲掉已通过增量事件收集到的参数
+                const input = this.responsesCallHasInput(item)
+                  ? this.responsesCallInput(item)
+                  : ''
+                ensureToolCall(key, toolId, this.responsesCallName(item), input)
               }
             }
           }
@@ -1007,7 +1010,7 @@ export class OpenAIParser implements ApiFormatParser {
 
     // Responses API call item -> 工具调用
     if (this.isResponsesCallItemType(itemType)) {
-      const toolName = this.responsesCallName(item) || '工具调用'
+      const toolName = this.responsesCallName(item)
       const args = this.formatJson(this.responsesCallInput(item))
       return createMessageBlock('assistant', [
         createToolUseRenderBlock(toolName, args, this.responsesCallId(item)),
@@ -1136,7 +1139,7 @@ export class OpenAIParser implements ApiFormatParser {
         } else if (this.isResponsesCallItemType(item.type)) {
           blocks.push(createMessageBlock('assistant', [
             createToolUseRenderBlock(
-              this.responsesCallName(item) || '工具调用',
+              this.responsesCallName(item),
               this.formatJson(this.responsesCallInput(item)),
               this.responsesCallId(item)
             ),
