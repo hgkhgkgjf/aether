@@ -799,7 +799,11 @@ onMounted(async () => {
   document.addEventListener('visibilitychange', handleVisibilityChange)
 
   if (isAdminPage.value) {
-    // 管理员页面优先加载记录，统计面板在后台顺序刷新，避免瞬时并发打满后端。
+    // 管理员页面优先启动热力图加载，避免被统计聚合链路阻塞。
+    const heatmapPromise = loadHeatmapData().catch(err => {
+      log.error('加载热力图数据失败:', err)
+    })
+
     await loadRecords(
       { page: currentPage.value, pageSize: pageSize.value },
       getCurrentFilters(),
@@ -807,7 +811,7 @@ onMounted(async () => {
     )
     void (async () => {
       await refreshAdminAnalytics({ force: true, preserveOnFailure: false })
-      await loadHeatmapData()
+      await heatmapPromise
       await loadAdminUsers()
     })()
   } else {
