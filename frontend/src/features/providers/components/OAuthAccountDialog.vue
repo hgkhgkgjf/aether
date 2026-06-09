@@ -681,10 +681,10 @@
               <span>成功 {{ importTask.success }} · 失败 {{ importTask.failed }}</span>
             </div>
             <p
-              v-if="importTask.message"
+              v-if="importTaskMessageText"
               class="text-[11px] text-muted-foreground"
             >
-              {{ importTask.message }}
+              {{ importTaskMessageText }}
             </p>
             <div
               v-if="importTask.error_samples.length > 0"
@@ -926,6 +926,7 @@ const importInputResetKey = ref(0)
 const importTask = ref<OAuthBatchImportTaskStatusResponse | null>(null)
 let importPollTimer: ReturnType<typeof setTimeout> | null = null
 const importPolling = ref(false)
+const redundantImportTaskMessagePattern = /^处理中(?:\s+\d+\s*\/\s*\d+)?$/
 const windsurfImportMethod = ref<WindsurfImportMethod>('email_password')
 const windsurfEmail = ref('')
 const windsurfPassword = ref('')
@@ -1034,6 +1035,13 @@ const importButtonText = computed(() => {
       : '导入中...'
   }
   return isWindsurfEmailPasswordImport.value ? '登录并导入' : importButtonLabel.value
+})
+
+const importTaskMessageText = computed(() => {
+  const message = importTask.value?.message?.trim()
+  if (!message) return ''
+  // 后端进度 message 已由“进度 x/y”展示，避免在导入中重复显示“处理中 x/y”。
+  return redundantImportTaskMessagePattern.test(message) ? '' : message
 })
 
 function stopImportPolling() {
