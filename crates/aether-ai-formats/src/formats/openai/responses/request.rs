@@ -9,7 +9,7 @@ use crate::{
     },
     protocol::canonical::{
         canonical_response_format_to_openai_responses, canonical_tool_is_openai_custom,
-        canonical_tool_use_to_openai_responses_item, is_claude_messages_request,
+        canonical_tool_use_to_openai_responses_input_item, is_claude_messages_request,
         is_claude_system_instruction, is_claude_thinking_block, is_claude_tool_result,
         is_openai_responses_input_message, is_openai_thinking_block, media_data_or_url,
         namespace_extension_object, openai_content_text, openai_extensions,
@@ -331,7 +331,7 @@ fn canonical_messages_to_responses_input(canonical: &CanonicalRequest) -> Option
                     let call_id = responses_tool_call_id(id, &mut next_generated_tool_call_index);
                     let tool_name = responses_tool_name(name);
                     pending_tool_call_ids.push_back(call_id.clone());
-                    input.push(canonical_tool_use_to_openai_responses_item(
+                    input.push(canonical_tool_use_to_openai_responses_input_item(
                         &call_id, &tool_name, arguments, extensions,
                     ));
                 }
@@ -1430,7 +1430,7 @@ mod tests {
 
         assert_eq!(body["input"].as_array().expect("input").len(), 2);
         assert_eq!(body["input"][0]["type"], "function_call");
-        assert_eq!(body["input"][0]["id"], "call_auto_0");
+        assert!(body["input"][0].get("id").is_none());
         assert_eq!(body["input"][0]["call_id"], "call_auto_0");
         assert_eq!(body["input"][0]["name"], "unknown");
         assert_eq!(body["input"][0]["arguments"], "{\"q\":\"rust\"}");

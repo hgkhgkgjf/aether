@@ -808,6 +808,66 @@ pub(crate) fn canonical_tool_use_to_openai_responses_item(
     })
 }
 
+pub(crate) fn canonical_tool_use_to_openai_responses_input_item(
+    id: &str,
+    name: &str,
+    input: &Value,
+    extensions: &BTreeMap<String, Value>,
+) -> Value {
+    if let Some(item_type) = openai_responses_hosted_tool_call_item_type(extensions) {
+        let mut item = Map::new();
+        item.insert("type".to_string(), Value::String(item_type.to_string()));
+        item.insert("id".to_string(), Value::String(id.to_string()));
+        item.insert("call_id".to_string(), Value::String(id.to_string()));
+        item.insert("status".to_string(), Value::String("completed".to_string()));
+        if let Some(input_object) = input.as_object() {
+            for field in openai_responses_hosted_tool_input_fields(item_type) {
+                if let Some(value) = input_object.get(*field) {
+                    item.insert((*field).to_string(), value.clone());
+                }
+            }
+        } else if item_type == "apply_patch_call" {
+            item.insert("operation".to_string(), input.clone());
+        } else if !name.trim().is_empty() {
+            item.insert("name".to_string(), Value::String(name.to_string()));
+        }
+        return Value::Object(item);
+    }
+    if is_openai_custom_tool_call(extensions) {
+        let mut item = Map::new();
+        item.insert(
+            "type".to_string(),
+            Value::String("custom_tool_call".to_string()),
+        );
+        if let Some(item_id) = openai_responses_request_tool_call_item_id(extensions, "ctc") {
+            item.insert("id".to_string(), Value::String(item_id));
+        }
+        item.insert("call_id".to_string(), Value::String(id.to_string()));
+        item.insert("status".to_string(), Value::String("completed".to_string()));
+        item.insert("name".to_string(), Value::String(name.to_string()));
+        item.insert(
+            "input".to_string(),
+            Value::String(openai_custom_tool_input_text(input)),
+        );
+        return Value::Object(item);
+    }
+    let mut item = Map::new();
+    item.insert(
+        "type".to_string(),
+        Value::String("function_call".to_string()),
+    );
+    if let Some(item_id) = openai_responses_request_tool_call_item_id(extensions, "fc") {
+        item.insert("id".to_string(), Value::String(item_id));
+    }
+    item.insert("call_id".to_string(), Value::String(id.to_string()));
+    item.insert("name".to_string(), Value::String(name.to_string()));
+    item.insert(
+        "arguments".to_string(),
+        Value::String(canonicalize_tool_arguments(input)),
+    );
+    Value::Object(item)
+}
+
 fn openai_responses_tool_call_item_id(
     call_id: &str,
     extensions: &BTreeMap<String, Value>,
@@ -826,6 +886,18 @@ fn openai_responses_tool_call_item_id(
     } else {
         trimmed.to_string()
     }
+}
+
+fn openai_responses_request_tool_call_item_id(
+    extensions: &BTreeMap<String, Value>,
+    prefix: &str,
+) -> Option<String> {
+    openai_responses_extension(extensions)
+        .and_then(|value| value.get("item_id").or_else(|| value.get("id")))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| value.starts_with(prefix))
+        .map(ToString::to_string)
 }
 
 fn openai_responses_hosted_tool_call_item_type(
