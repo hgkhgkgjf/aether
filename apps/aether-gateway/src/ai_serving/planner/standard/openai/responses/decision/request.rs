@@ -32,8 +32,9 @@ use crate::ai_serving::planner::standard::{
 use crate::ai_serving::transport::antigravity::{
     build_antigravity_safe_v1internal_request, build_antigravity_static_identity_headers,
     classify_local_antigravity_request_support, is_antigravity_provider_transport,
-    AntigravityEnvelopeRequestType, AntigravityRequestEnvelopeSupport,
-    AntigravityRequestSideSupport, AntigravityRequestSideUnsupportedReason,
+    AntigravityEnvelopeRequestType, AntigravityRequestAuthUnsupportedReason,
+    AntigravityRequestEnvelopeSupport, AntigravityRequestSideSupport,
+    AntigravityRequestSideUnsupportedReason,
 };
 use crate::ai_serving::transport::auth::{
     resolve_local_gemini_auth, resolve_local_openai_bearer_auth, resolve_local_standard_auth,
@@ -424,7 +425,7 @@ pub(crate) async fn resolve_local_openai_responses_candidate_payload_parts(
             antigravity_support,
             AntigravityRequestSideSupport::Unsupported(
                 AntigravityRequestSideUnsupportedReason::UnsupportedAuth(
-                    crate::provider_transport::antigravity::AntigravityRequestAuthUnsupportedReason::MissingProjectId
+                    AntigravityRequestAuthUnsupportedReason::MissingProjectId
                 )
             )
         ) {

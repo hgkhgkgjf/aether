@@ -13,8 +13,8 @@ use crate::ai_serving::planner::redaction::{
 use crate::ai_serving::transport::antigravity::{
     build_antigravity_safe_v1internal_request, build_antigravity_static_identity_headers,
     classify_local_antigravity_request_support, AntigravityEnvelopeRequestType,
-    AntigravityRequestEnvelopeSupport, AntigravityRequestSideSupport,
-    AntigravityRequestSideUnsupportedReason,
+    AntigravityRequestAuthUnsupportedReason, AntigravityRequestEnvelopeSupport,
+    AntigravityRequestSideSupport, AntigravityRequestSideUnsupportedReason,
 };
 use crate::ai_serving::transport::{
     build_gemini_cli_v1internal_request, build_grok_browser_headers, build_grok_upstream_url,
@@ -240,7 +240,7 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
             antigravity_support,
             AntigravityRequestSideSupport::Unsupported(
                 AntigravityRequestSideUnsupportedReason::UnsupportedAuth(
-                    crate::provider_transport::antigravity::AntigravityRequestAuthUnsupportedReason::MissingProjectId
+                    AntigravityRequestAuthUnsupportedReason::MissingProjectId
                 )
             )
         ) {
