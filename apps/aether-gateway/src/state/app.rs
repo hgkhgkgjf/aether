@@ -4,13 +4,16 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
+use aether_data::repository::users::StoredUserGroup;
+use aether_data_contracts::repository::quota::StoredProviderQuotaSnapshot;
 use aether_runtime::ConcurrencyGate;
 use aether_runtime_state::{RuntimeSemaphore, RuntimeState};
 
 use super::super::async_task::{VideoTaskPollerConfig, VideoTaskService};
 use super::super::cache::{
-    AuthApiKeyLastUsedCache, AuthContextCache, DashboardResponseCache, DirectPlanBypassCache,
-    SchedulerAffinityCache, SystemConfigCache,
+    AuthApiKeyFeatureCacheKey, AuthApiKeyIdentityCacheKey, AuthApiKeyLastUsedCache,
+    AuthContextCache, AuthSnapshotCache, DashboardResponseCache, DirectPlanBypassCache,
+    JsonValueCache, SchedulerAffinityCache, SystemConfigCache, ValueCache,
 };
 use super::super::data::GatewayDataState;
 use super::super::fallback_metrics;
@@ -116,6 +119,14 @@ pub struct AppState {
     pub(crate) distributed_request_gate: Option<Arc<RuntimeSemaphore>>,
     pub(crate) client: reqwest::Client,
     pub(crate) auth_context_cache: Arc<AuthContextCache>,
+    pub(crate) auth_snapshot_cache: Arc<AuthSnapshotCache>,
+    pub(crate) user_model_capability_settings_cache: Arc<JsonValueCache<String>>,
+    pub(crate) user_feature_settings_cache: Arc<JsonValueCache<String>>,
+    pub(crate) auth_api_key_force_capabilities_cache:
+        Arc<JsonValueCache<AuthApiKeyIdentityCacheKey>>,
+    pub(crate) auth_api_key_feature_settings_cache: Arc<JsonValueCache<AuthApiKeyFeatureCacheKey>>,
+    pub(crate) provider_quota_snapshot_cache: Arc<ValueCache<String, StoredProviderQuotaSnapshot>>,
+    pub(crate) user_groups_for_user_cache: Arc<ValueCache<String, Vec<StoredUserGroup>>>,
     pub(crate) auth_api_key_last_used_cache: Arc<AuthApiKeyLastUsedCache>,
     pub(crate) oauth_refresh: Arc<provider_transport::LocalOAuthRefreshCoordinator>,
     pub(crate) direct_plan_bypass_cache: Arc<DirectPlanBypassCache>,

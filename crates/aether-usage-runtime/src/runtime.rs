@@ -1,9 +1,9 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use aether_contracts::ExecutionTelemetry;
-use aether_data_contracts::repository::usage::UpsertUsageRecord;
 use aether_data_contracts::DataLayerError;
 use aether_runtime_state::RuntimeQueueStore;
 use async_trait::async_trait;
@@ -11,12 +11,12 @@ use tracing::warn;
 
 use crate::executor::spawn_on_usage_background_runtime;
 use crate::{
-    apply_usage_body_capture_policy_to_event, apply_usage_body_capture_policy_to_record,
-    build_stream_terminal_usage_seed, build_sync_terminal_usage_seed,
-    build_terminal_usage_event_from_seed, build_upsert_usage_record_from_event,
-    build_usage_queue_worker, settle_usage_if_needed, LifecycleUsageSeed,
-    StreamTerminalUsagePayloadSeed, SyncTerminalUsagePayloadSeed, TerminalUsageContextSeed,
-    UsageEvent, UsageQueue, UsageRecordWriter, UsageRuntimeConfig, UsageSettlementWriter,
+    apply_usage_body_capture_policy_to_event, build_stream_terminal_usage_seed,
+    build_sync_terminal_usage_seed, build_terminal_usage_event_from_seed,
+    build_upsert_usage_record_from_event, build_usage_queue_worker, settle_usage_if_needed,
+    LifecycleUsageSeed, StreamTerminalUsagePayloadSeed, SyncTerminalUsagePayloadSeed,
+    TerminalUsageContextSeed, UsageEvent, UsageQueue, UsageRecordWriter, UsageRuntimeConfig,
+    UsageSettlementWriter,
 };
 
 #[async_trait]
@@ -76,7 +76,10 @@ pub trait UsageRuntimeAccess:
 #[derive(Debug, Clone)]
 pub struct UsageRuntime {
     config: UsageRuntimeConfig,
+    body_policy_cache: Arc<tokio::sync::Mutex<Option<(Instant, UsageBodyCapturePolicy)>>>,
 }
+
+const USAGE_BODY_CAPTURE_POLICY_CACHE_TTL: Duration = Duration::from_secs(30);
 
 impl Default for UsageRuntime {
     fn default() -> Self {
@@ -88,12 +91,16 @@ impl UsageRuntime {
     pub fn disabled() -> Self {
         Self {
             config: UsageRuntimeConfig::disabled(),
+            body_policy_cache: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
     pub fn new(config: UsageRuntimeConfig) -> Result<Self, DataLayerError> {
         config.validate()?;
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            body_policy_cache: Arc::new(tokio::sync::Mutex::new(None)),
+        })
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -105,7 +112,7 @@ impl UsageRuntime {
         T: UsageRuntimeAccess,
     {
         self.is_enabled()
-            && self.config.queue_terminal_events
+            && (self.config.queue_terminal_events || self.config.queue_lifecycle_events)
             && data.has_usage_writer()
             && data.has_usage_worker_queue()
     }
@@ -129,30 +136,25 @@ impl UsageRuntime {
         if !self.is_enabled() {
             return;
         }
+        let runtime = self.clone();
         let data = T::clone(data);
         let request_id = seed.request_id.clone();
         spawn_on_usage_background_runtime(boxed_usage_task(async move {
             let now_unix_secs = now_unix_secs();
-            match build_pending_usage_record_offthread(seed, now_unix_secs).await {
-                Ok(mut record) => {
-                    apply_body_capture_policy_to_record_from_data(&data, &mut record).await;
-                    if let Err(err) = data.upsert_usage_record(record).await {
-                        warn!(
-                            event_name = "usage_pending_record_failed",
-                            log_type = "event",
-                            request_id = %request_id,
-                            error = %err,
-                            "usage runtime failed to record sync pending usage"
-                        );
-                    }
+            match build_pending_usage_event_offthread(seed, now_unix_secs).await {
+                Ok(mut event) => {
+                    runtime
+                        .apply_body_capture_policy_from_data(&data, &mut event)
+                        .await;
+                    runtime.enqueue_or_write_lifecycle(&data, event).await;
                 }
                 Err(err) => {
                     warn!(
-                        event_name = "usage_pending_build_failed",
+                        event_name = "usage_pending_event_build_failed",
                         log_type = "event",
                         request_id = %request_id,
                         error = %err,
-                        "usage runtime failed to build sync pending usage"
+                        "usage runtime failed to build sync pending usage event"
                     )
                 }
             }
@@ -171,39 +173,29 @@ impl UsageRuntime {
         if !self.is_enabled() {
             return;
         }
+        let runtime = self.clone();
         let data = T::clone(data);
         let seed = seed.clone();
         let telemetry = telemetry.cloned();
         let request_id = seed.request_id.clone();
         spawn_on_usage_background_runtime(boxed_usage_task(async move {
             let now_unix_secs = now_unix_secs();
-            match build_streaming_usage_record_offthread(
-                seed,
-                status_code,
-                telemetry,
-                now_unix_secs,
-            )
-            .await
+            match build_streaming_usage_event_offthread(seed, status_code, telemetry, now_unix_secs)
+                .await
             {
-                Ok(mut record) => {
-                    apply_body_capture_policy_to_record_from_data(&data, &mut record).await;
-                    if let Err(err) = data.upsert_usage_record(record).await {
-                        warn!(
-                            event_name = "usage_stream_record_failed",
-                            log_type = "event",
-                            request_id = %request_id,
-                            error = %err,
-                            "usage runtime failed to record stream usage"
-                        );
-                    }
+                Ok(mut event) => {
+                    runtime
+                        .apply_body_capture_policy_from_data(&data, &mut event)
+                        .await;
+                    runtime.enqueue_or_write_lifecycle(&data, event).await;
                 }
                 Err(err) => {
                     warn!(
-                        event_name = "usage_stream_build_failed",
+                        event_name = "usage_stream_event_build_failed",
                         log_type = "event",
                         request_id = %request_id,
                         error = %err,
-                        "usage runtime failed to build stream usage"
+                        "usage runtime failed to build stream usage event"
                     )
                 }
             }
@@ -227,7 +219,9 @@ impl UsageRuntime {
         spawn_on_usage_background_runtime(boxed_usage_task(async move {
             match build_sync_terminal_usage_event_offthread(context_seed, payload_seed).await {
                 Ok(mut event) => {
-                    apply_body_capture_policy_from_data(&data, &mut event).await;
+                    runtime
+                        .apply_body_capture_policy_from_data(&data, &mut event)
+                        .await;
                     if let Err(err) = data.enrich_usage_event(&mut event).await {
                         warn!(
                             event_name = "usage_sync_terminal_billing_enrichment_failed",
@@ -272,7 +266,9 @@ impl UsageRuntime {
                 .await
             {
                 Ok(mut event) => {
-                    apply_body_capture_policy_from_data(&data, &mut event).await;
+                    runtime
+                        .apply_body_capture_policy_from_data(&data, &mut event)
+                        .await;
                     if let Err(err) = data.enrich_usage_event(&mut event).await {
                         warn!(
                             event_name = "usage_stream_terminal_billing_enrichment_failed",
@@ -318,7 +314,8 @@ impl UsageRuntime {
         if !self.is_enabled() {
             return;
         }
-        apply_body_capture_policy_from_data(data, &mut event).await;
+        self.apply_body_capture_policy_from_data(data, &mut event)
+            .await;
         if let Err(err) = data.enrich_usage_event(&mut event).await {
             warn!(
                 event_name = "usage_terminal_billing_enrichment_failed",
@@ -338,7 +335,8 @@ impl UsageRuntime {
         if !self.is_enabled() {
             return;
         }
-        apply_body_capture_policy_from_data(data, &mut event).await;
+        self.apply_body_capture_policy_from_data(data, &mut event)
+            .await;
         if let Err(err) = data.enrich_usage_event(&mut event).await {
             warn!(
                 event_name = "usage_terminal_billing_enrichment_failed",
@@ -348,33 +346,106 @@ impl UsageRuntime {
                 "usage runtime failed to enrich terminal usage event with billing"
             );
         }
-        self.write_terminal_direct(data, &event).await;
+        self.write_event_direct(data, &event).await;
+    }
+
+    async fn apply_body_capture_policy_from_data<T>(&self, data: &T, event: &mut UsageEvent)
+    where
+        T: UsageRuntimeAccess,
+    {
+        match self.cached_body_capture_policy(data).await {
+            Ok(policy) => apply_usage_body_capture_policy_to_event(policy, event),
+            Err(err) => {
+                warn!(
+                    event_name = "usage_body_capture_policy_read_failed",
+                    log_type = "event",
+                    request_id = %event.request_id,
+                    fallback = "default",
+                    error = %err,
+                    "usage runtime failed to read body capture policy; keeping default capture"
+                );
+                apply_usage_body_capture_policy_to_event(UsageBodyCapturePolicy::default(), event);
+            }
+        }
+    }
+
+    pub async fn body_capture_policy_for<T>(
+        &self,
+        data: &T,
+    ) -> Result<UsageBodyCapturePolicy, DataLayerError>
+    where
+        T: UsageRuntimeAccess,
+    {
+        self.cached_body_capture_policy(data).await
+    }
+
+    async fn cached_body_capture_policy<T>(
+        &self,
+        data: &T,
+    ) -> Result<UsageBodyCapturePolicy, DataLayerError>
+    where
+        T: UsageRuntimeAccess,
+    {
+        let mut cache = self.body_policy_cache.lock().await;
+        if let Some((cached_at, policy)) = cache.as_ref() {
+            if cached_at.elapsed() <= USAGE_BODY_CAPTURE_POLICY_CACHE_TTL {
+                return Ok(*policy);
+            }
+        }
+        let policy = data.body_capture_policy().await?;
+        *cache = Some((Instant::now(), policy));
+        Ok(policy)
     }
 
     async fn enqueue_or_write_terminal<T>(&self, data: &T, event: UsageEvent)
     where
         T: UsageRuntimeAccess,
     {
-        if self.config.queue_terminal_events {
+        self.enqueue_or_write_event(data, event, "terminal", self.config.queue_terminal_events)
+            .await;
+    }
+
+    async fn enqueue_or_write_lifecycle<T>(&self, data: &T, event: UsageEvent)
+    where
+        T: UsageRuntimeAccess,
+    {
+        self.enqueue_or_write_event(data, event, "lifecycle", self.config.queue_lifecycle_events)
+            .await;
+    }
+
+    async fn enqueue_or_write_event<T>(
+        &self,
+        data: &T,
+        event: UsageEvent,
+        event_phase: &'static str,
+        queue_enabled: bool,
+    ) where
+        T: UsageRuntimeAccess,
+    {
+        if queue_enabled {
             if let Some(runner) = data.usage_worker_queue() {
                 match UsageQueue::new(runner, self.config.clone()) {
                     Ok(queue) => match queue.enqueue(&event).await {
                         Ok(_) => return,
                         Err(err) => {
                             warn!(
-                                event_name = "usage_terminal_enqueue_failed",
+                                event_name = "usage_event_enqueue_failed",
                                 log_type = "event",
+                                event_phase,
+                                usage_event_type = ?event.event_type,
                                 request_id = %event.request_id,
                                 fallback = "direct_write",
                                 error = %err,
-                                "usage runtime failed to enqueue terminal usage event; falling back to direct write"
+                                "usage runtime failed to enqueue usage event; falling back to direct write"
                             )
                         }
                     },
                     Err(err) => {
                         warn!(
-                            event_name = "usage_terminal_queue_init_failed",
+                            event_name = "usage_event_queue_init_failed",
                             log_type = "event",
+                            event_phase,
+                            usage_event_type = ?event.event_type,
                             request_id = %event.request_id,
                             fallback = "direct_write",
                             error = %err,
@@ -385,10 +456,10 @@ impl UsageRuntime {
             }
         }
 
-        self.write_terminal_direct(data, &event).await;
+        self.write_event_direct(data, &event).await;
     }
 
-    async fn write_terminal_direct<T>(&self, data: &T, event: &UsageEvent)
+    async fn write_event_direct<T>(&self, data: &T, event: &UsageEvent)
     where
         T: UsageRuntimeAccess,
     {
@@ -408,46 +479,48 @@ impl UsageRuntime {
                 Ok(None) => {}
                 Err(err) => {
                     warn!(
-                        event_name = "usage_terminal_upsert_failed",
+                        event_name = "usage_event_upsert_failed",
                         log_type = "event",
+                        usage_event_type = ?event.event_type,
                         request_id = %event.request_id,
                         error = %err,
-                        "usage runtime failed to upsert terminal usage directly"
+                        "usage runtime failed to upsert usage event directly"
                     );
                 }
             },
             Err(err) => {
                 warn!(
-                    event_name = "usage_terminal_upsert_build_failed",
+                    event_name = "usage_event_upsert_build_failed",
                     log_type = "event",
+                    usage_event_type = ?event.event_type,
                     request_id = %event.request_id,
                     error = %err,
-                    "usage runtime failed to build terminal usage upsert"
+                    "usage runtime failed to build usage event upsert"
                 )
             }
         }
     }
 }
 
-async fn build_pending_usage_record_offthread(
+async fn build_pending_usage_event_offthread(
     seed: LifecycleUsageSeed,
     now_unix_secs: u64,
-) -> Result<UpsertUsageRecord, DataLayerError> {
+) -> Result<UsageEvent, DataLayerError> {
     tokio::task::spawn_blocking(move || {
-        crate::write::build_pending_usage_record_from_owned_seed(seed, now_unix_secs)
+        crate::write::build_pending_usage_event_from_owned_seed(seed, now_unix_secs)
     })
     .await
     .map_err(join_error_to_data_layer)?
 }
 
-async fn build_streaming_usage_record_offthread(
+async fn build_streaming_usage_event_offthread(
     seed: LifecycleUsageSeed,
     status_code: u16,
     telemetry: Option<ExecutionTelemetry>,
     now_unix_secs: u64,
-) -> Result<UpsertUsageRecord, DataLayerError> {
+) -> Result<UsageEvent, DataLayerError> {
     tokio::task::spawn_blocking(move || {
-        crate::write::build_streaming_usage_record_from_owned_seed(
+        crate::write::build_streaming_usage_event_from_owned_seed(
             seed,
             status_code,
             telemetry,
@@ -492,46 +565,6 @@ fn join_error_to_data_layer(err: tokio::task::JoinError) -> DataLayerError {
     DataLayerError::UnexpectedValue(format!("usage builder task join failed: {err}"))
 }
 
-async fn apply_body_capture_policy_from_data<T>(data: &T, event: &mut UsageEvent)
-where
-    T: UsageRuntimeAccess,
-{
-    match data.body_capture_policy().await {
-        Ok(policy) => apply_usage_body_capture_policy_to_event(policy, event),
-        Err(err) => {
-            warn!(
-                event_name = "usage_body_capture_policy_read_failed",
-                log_type = "event",
-                request_id = %event.request_id,
-                fallback = "default",
-                error = %err,
-                "usage runtime failed to read body capture policy; keeping default capture"
-            );
-            apply_usage_body_capture_policy_to_event(UsageBodyCapturePolicy::default(), event);
-        }
-    }
-}
-
-async fn apply_body_capture_policy_to_record_from_data<T>(data: &T, record: &mut UpsertUsageRecord)
-where
-    T: UsageRuntimeAccess,
-{
-    match data.body_capture_policy().await {
-        Ok(policy) => apply_usage_body_capture_policy_to_record(policy, record),
-        Err(err) => {
-            warn!(
-                event_name = "usage_body_capture_policy_read_failed",
-                log_type = "event",
-                request_id = %record.request_id,
-                fallback = "default",
-                error = %err,
-                "usage runtime failed to read body capture policy; keeping default capture"
-            );
-            apply_usage_body_capture_policy_to_record(UsageBodyCapturePolicy::default(), record);
-        }
-    }
-}
-
 fn boxed_usage_task<F>(task: F) -> Pin<Box<dyn Future<Output = ()> + Send>>
 where
     F: Future<Output = ()> + Send + 'static,
@@ -548,8 +581,10 @@ fn now_unix_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
+    use aether_contracts::{ExecutionPlan, RequestBody};
     use aether_data_contracts::repository::settlement::{
         StoredUsageSettlement, UsageSettlementInput,
     };
@@ -558,6 +593,7 @@ mod tests {
     use aether_runtime_state::{MemoryRuntimeStateConfig, RuntimeQueueStore, RuntimeState};
     use async_trait::async_trait;
     use serde_json::json;
+    use tokio::time::{sleep, Duration};
 
     use super::{
         UsageBillingEventEnricher, UsageBodyCapturePolicy, UsageRequestRecordLevel,
@@ -565,8 +601,9 @@ mod tests {
     };
     use crate::worker::ManualProxyNodeCounter;
     use crate::{
-        apply_usage_body_capture_policy_to_event, UsageEvent, UsageEventData, UsageEventType,
-        UsageRecordWriter, UsageRuntime, UsageRuntimeConfig, UsageSettlementWriter,
+        apply_usage_body_capture_policy_to_event, build_lifecycle_usage_seed, UsageEvent,
+        UsageEventData, UsageEventType, UsageQueue, UsageRecordWriter, UsageRuntime,
+        UsageRuntimeConfig, UsageSettlementWriter,
     };
 
     #[derive(Default)]
@@ -576,6 +613,12 @@ mod tests {
 
     struct QueueConfiguredUsageStore {
         inner: NoRedisUsageStore,
+        queue: Arc<dyn RuntimeQueueStore>,
+    }
+
+    #[derive(Clone)]
+    struct CloneQueueConfiguredUsageStore {
+        records: Arc<Mutex<Vec<UpsertUsageRecord>>>,
         queue: Arc<dyn RuntimeQueueStore>,
     }
 
@@ -696,6 +739,65 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl UsageRecordWriter for CloneQueueConfiguredUsageStore {
+        async fn upsert_usage_record(
+            &self,
+            record: UpsertUsageRecord,
+        ) -> Result<Option<StoredRequestUsageAudit>, DataLayerError> {
+            self.records.lock().expect("records lock").push(record);
+            Ok(None)
+        }
+    }
+
+    #[async_trait]
+    impl UsageSettlementWriter for CloneQueueConfiguredUsageStore {
+        fn has_usage_settlement_writer(&self) -> bool {
+            false
+        }
+
+        async fn settle_usage(
+            &self,
+            _input: UsageSettlementInput,
+        ) -> Result<Option<StoredUsageSettlement>, DataLayerError> {
+            Ok(None)
+        }
+    }
+
+    #[async_trait]
+    impl UsageBillingEventEnricher for CloneQueueConfiguredUsageStore {
+        async fn enrich_usage_event(&self, _event: &mut UsageEvent) -> Result<(), DataLayerError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ManualProxyNodeCounter for CloneQueueConfiguredUsageStore {
+        async fn increment_manual_proxy_node_requests(
+            &self,
+            _node_id: &str,
+            _total_delta: i64,
+            _failed_delta: i64,
+            _latency_ms: Option<i64>,
+        ) -> Result<(), DataLayerError> {
+            Ok(())
+        }
+    }
+
+    impl UsageRuntimeAccess for CloneQueueConfiguredUsageStore {
+        fn has_usage_writer(&self) -> bool {
+            true
+        }
+
+        fn has_usage_worker_queue(&self) -> bool {
+            true
+        }
+
+        fn usage_worker_queue(&self) -> Option<Arc<dyn RuntimeQueueStore>> {
+            Some(Arc::clone(&self.queue))
+        }
+    }
+
     #[tokio::test]
     async fn terminal_usage_without_redis_writes_directly_to_usage_repository() {
         let runtime = UsageRuntime::new(UsageRuntimeConfig {
@@ -760,6 +862,75 @@ mod tests {
         assert_eq!(records[0].status, "failed");
         assert_eq!(records[0].billing_status, "void");
         assert_eq!(records[0].status_code, Some(503));
+    }
+
+    #[tokio::test]
+    async fn pending_usage_uses_lifecycle_queue_when_enabled() {
+        let config = UsageRuntimeConfig {
+            enabled: true,
+            queue_lifecycle_events: true,
+            stream_key: "usage:events:test:pending".to_string(),
+            consumer_group: "usage_consumers_test_pending".to_string(),
+            consumer_block_ms: 1,
+            ..UsageRuntimeConfig::default()
+        };
+        let queue_runner: Arc<dyn RuntimeQueueStore> =
+            Arc::new(RuntimeState::memory(MemoryRuntimeStateConfig::default()));
+        let queue = UsageQueue::new(Arc::clone(&queue_runner), config.clone())
+            .expect("usage queue should build");
+        queue
+            .ensure_consumer_group()
+            .await
+            .expect("consumer group should initialize");
+        let store = CloneQueueConfiguredUsageStore {
+            records: Arc::new(Mutex::new(Vec::new())),
+            queue: queue_runner,
+        };
+        let runtime = UsageRuntime::new(config).expect("usage runtime should build");
+        let plan = ExecutionPlan {
+            request_id: "req-lifecycle-queue-pending-1".to_string(),
+            candidate_id: Some("cand-lifecycle-queue-pending-1".to_string()),
+            provider_name: Some("openai".to_string()),
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+            method: "POST".to_string(),
+            url: "https://example.com/v1/responses".to_string(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({"model": "gpt-5"})),
+            stream: false,
+            client_api_format: "openai:responses".to_string(),
+            provider_api_format: "openai:responses".to_string(),
+            model_name: Some("gpt-5".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+
+        runtime.record_pending(&store, build_lifecycle_usage_seed(&plan, None));
+
+        for _ in 0..50 {
+            let entries = queue
+                .read_group("usage-test-consumer")
+                .await
+                .expect("queue read should succeed");
+            if let Some(entry) = entries.into_iter().next() {
+                let event = UsageEvent::from_stream_fields(&entry.fields)
+                    .expect("queued usage event should parse");
+                assert_eq!(event.event_type, UsageEventType::Pending);
+                assert_eq!(event.request_id, "req-lifecycle-queue-pending-1");
+                assert!(
+                    store.records.lock().expect("records lock").is_empty(),
+                    "pending lifecycle event should not write directly when queue succeeds"
+                );
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        panic!("pending lifecycle usage event was not enqueued");
     }
 
     #[test]

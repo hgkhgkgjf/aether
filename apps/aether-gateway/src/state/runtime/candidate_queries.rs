@@ -1,5 +1,8 @@
 use crate::{AppState, GatewayError};
 use aether_data_contracts::repository::{candidate_selection, candidates, quota};
+use std::time::Duration;
+
+const PROVIDER_QUOTA_RUNTIME_CACHE_TTL: Duration = Duration::from_secs(5);
 
 impl AppState {
     pub(crate) async fn list_minimal_candidate_selection_rows_for_api_format(
@@ -71,10 +74,19 @@ impl AppState {
         &self,
         provider_id: &str,
     ) -> Result<Option<quota::StoredProviderQuotaSnapshot>, GatewayError> {
-        self.data
-            .find_provider_quota_by_provider_id(provider_id)
+        let provider_id = provider_id.trim();
+        if provider_id.is_empty() {
+            return Ok(None);
+        }
+        let cache_key = provider_id.to_string();
+        self.provider_quota_snapshot_cache
+            .get_or_load(cache_key, PROVIDER_QUOTA_RUNTIME_CACHE_TTL, || async move {
+                self.data
+                    .find_provider_quota_by_provider_id(provider_id)
+                    .await
+                    .map_err(|err| GatewayError::Internal(err.to_string()))
+            })
             .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))
     }
 
     pub(crate) async fn read_provider_quota_snapshots(

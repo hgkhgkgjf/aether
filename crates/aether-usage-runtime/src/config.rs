@@ -4,6 +4,7 @@ use aether_data_contracts::DataLayerError;
 pub struct UsageRuntimeConfig {
     pub enabled: bool,
     pub queue_terminal_events: bool,
+    pub queue_lifecycle_events: bool,
     pub stream_key: String,
     pub consumer_group: String,
     pub dlq_stream_key: String,
@@ -20,14 +21,15 @@ impl Default for UsageRuntimeConfig {
         Self {
             enabled: false,
             queue_terminal_events: false,
+            queue_lifecycle_events: false,
             stream_key: "usage:events".to_string(),
             consumer_group: "usage_consumers".to_string(),
             dlq_stream_key: "usage:events:dlq".to_string(),
-            stream_maxlen: 2_000,
-            consumer_batch_size: 200,
+            stream_maxlen: 200_000,
+            consumer_batch_size: 500,
             consumer_block_ms: 500,
             reclaim_idle_ms: 30_000,
-            reclaim_count: 200,
+            reclaim_count: 500,
             reclaim_interval_ms: 5_000,
         }
     }

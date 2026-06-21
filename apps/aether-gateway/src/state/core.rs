@@ -29,9 +29,9 @@ use super::super::async_task::{
     spawn_video_task_poller, VideoTaskPollerConfig, VideoTaskService, VideoTaskTruthSourceMode,
 };
 use super::super::cache::{
-    AuthApiKeyLastUsedCache, AuthContextCache, DashboardResponseCache, DirectPlanBypassCache,
-    SchedulerAffinityCache, SchedulerAffinitySnapshotEntry, SchedulerAffinityTarget,
-    SystemConfigCache,
+    AuthApiKeyLastUsedCache, AuthContextCache, AuthSnapshotCache, DashboardResponseCache,
+    DirectPlanBypassCache, JsonValueCache, SchedulerAffinityCache, SchedulerAffinitySnapshotEntry,
+    SchedulerAffinityTarget, SystemConfigCache, ValueCache,
 };
 use super::super::data::{GatewayDataConfig, GatewayDataState};
 use super::super::fallback_metrics;
@@ -62,7 +62,7 @@ use crate::maintenance::spawn_usage_cleanup_worker;
 use crate::maintenance::spawn_usage_counter_flush_worker;
 use crate::maintenance::spawn_wallet_daily_usage_aggregation_worker;
 
-const SYSTEM_CONFIG_CACHE_TTL: Duration = Duration::from_secs(3);
+const SYSTEM_CONFIG_CACHE_TTL: Duration = Duration::from_secs(30);
 const SCHEDULER_AFFECTING_SYSTEM_CONFIG_KEYS: &[&str] = &[
     "enable_format_conversion",
     "keep_priority_on_conversion",
@@ -236,6 +236,13 @@ impl AppState {
             distributed_request_gate: None,
             client,
             auth_context_cache: Arc::new(AuthContextCache::default()),
+            auth_snapshot_cache: Arc::new(AuthSnapshotCache::default()),
+            user_model_capability_settings_cache: Arc::new(JsonValueCache::default()),
+            user_feature_settings_cache: Arc::new(JsonValueCache::default()),
+            auth_api_key_force_capabilities_cache: Arc::new(JsonValueCache::default()),
+            auth_api_key_feature_settings_cache: Arc::new(JsonValueCache::default()),
+            provider_quota_snapshot_cache: Arc::new(ValueCache::default()),
+            user_groups_for_user_cache: Arc::new(ValueCache::default()),
             auth_api_key_last_used_cache: Arc::new(AuthApiKeyLastUsedCache::default()),
             oauth_refresh: Arc::new(provider_transport::LocalOAuthRefreshCoordinator::new()),
             direct_plan_bypass_cache: Arc::new(DirectPlanBypassCache::default()),
@@ -502,6 +509,11 @@ impl AppState {
             return Ok(value);
         }
 
+        let _guard = self.system_config_cache.load_guard().await;
+        if let Some(value) = self.system_config_cache.get(key, SYSTEM_CONFIG_CACHE_TTL) {
+            return Ok(value);
+        }
+
         let value = self
             .data
             .find_system_config_value(key)
@@ -586,6 +598,13 @@ impl AppState {
 
     pub(crate) fn invalidate_auth_context_cache(&self) {
         self.auth_context_cache.clear();
+        self.auth_snapshot_cache.clear();
+        self.user_model_capability_settings_cache.clear();
+        self.user_feature_settings_cache.clear();
+        self.auth_api_key_force_capabilities_cache.clear();
+        self.auth_api_key_feature_settings_cache.clear();
+        self.provider_quota_snapshot_cache.clear();
+        self.user_groups_for_user_cache.clear();
     }
 
     fn remember_system_config_write(&self, key: &str, value: Option<serde_json::Value>) {
@@ -895,6 +914,9 @@ impl AppState {
                     )]),
                 ),
             }
+        }
+        if let Some(summary) = self.data.database_pool_summary() {
+            samples.extend(database_pool_metric_samples(&summary));
         }
         samples.extend(self.tunnel.metric_samples());
         samples.extend(self.fallback_metrics.metric_samples());
@@ -1277,6 +1299,69 @@ impl AppState {
 
         supervisor
     }
+}
+
+fn database_pool_metric_samples(summary: &aether_data::DatabasePoolSummary) -> Vec<MetricSample> {
+    let labels = vec![MetricLabel::new("driver", summary.driver.to_string())];
+    let usage_basis_points = if summary.usage_rate.is_finite() && summary.usage_rate > 0.0 {
+        (summary.usage_rate * 100.0).round() as u64
+    } else {
+        0
+    };
+    let under_maintenance_pressure =
+        GatewayDataState::database_pool_summary_under_maintenance_pressure(summary);
+
+    vec![
+        MetricSample::new(
+            "database_pool_checked_out_connections",
+            "Number of database connections currently checked out from the gateway pool.",
+            MetricKind::Gauge,
+            summary.checked_out as u64,
+        )
+        .with_labels(labels.clone()),
+        MetricSample::new(
+            "database_pool_idle_connections",
+            "Number of idle database connections currently available in the gateway pool.",
+            MetricKind::Gauge,
+            summary.idle as u64,
+        )
+        .with_labels(labels.clone()),
+        MetricSample::new(
+            "database_pool_size_connections",
+            "Current number of database connections opened by the gateway pool.",
+            MetricKind::Gauge,
+            summary.pool_size as u64,
+        )
+        .with_labels(labels.clone()),
+        MetricSample::new(
+            "database_pool_max_connections",
+            "Configured maximum number of database connections for the gateway pool.",
+            MetricKind::Gauge,
+            summary.max_connections as u64,
+        )
+        .with_labels(labels.clone()),
+        MetricSample::new(
+            "database_pool_usage_basis_points",
+            "Database pool usage rate in basis points, where 10000 means 100 percent.",
+            MetricKind::Gauge,
+            usage_basis_points,
+        )
+        .with_labels(labels.clone()),
+        MetricSample::new(
+            "database_pool_idle_reserve_connections",
+            "Idle database connections reserved for foreground traffic before maintenance defers.",
+            MetricKind::Gauge,
+            GatewayDataState::maintenance_pool_idle_reserve(summary) as u64,
+        )
+        .with_labels(labels.clone()),
+        MetricSample::new(
+            "database_pool_under_maintenance_pressure",
+            "Whether maintenance workers should currently defer for foreground database pool capacity.",
+            MetricKind::Gauge,
+            u64::from(under_maintenance_pressure),
+        )
+        .with_labels(labels),
+    ]
 }
 
 fn should_preserve_runtime_miss_diagnostic(

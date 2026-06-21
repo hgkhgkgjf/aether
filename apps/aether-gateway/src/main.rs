@@ -496,6 +496,20 @@ impl GatewayDataArgs {
 struct GatewayUsageArgs {
     #[arg(
         long,
+        env = "AETHER_GATEWAY_USAGE_QUEUE_TERMINAL_EVENTS",
+        default_value_t = true
+    )]
+    queue_terminal_events: bool,
+
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_USAGE_QUEUE_LIFECYCLE_EVENTS",
+        default_value_t = true
+    )]
+    queue_lifecycle_events: bool,
+
+    #[arg(
+        long,
         env = "AETHER_GATEWAY_USAGE_QUEUE_STREAM_KEY",
         default_value = "usage:events"
     )]
@@ -518,14 +532,14 @@ struct GatewayUsageArgs {
     #[arg(
         long,
         env = "AETHER_GATEWAY_USAGE_QUEUE_STREAM_MAXLEN",
-        default_value_t = 2_000
+        default_value_t = 200_000
     )]
     queue_stream_maxlen: usize,
 
     #[arg(
         long,
         env = "AETHER_GATEWAY_USAGE_QUEUE_BATCH_SIZE",
-        default_value_t = 200
+        default_value_t = 500
     )]
     queue_batch_size: usize,
 
@@ -546,7 +560,7 @@ struct GatewayUsageArgs {
     #[arg(
         long,
         env = "AETHER_GATEWAY_USAGE_QUEUE_RECLAIM_COUNT",
-        default_value_t = 200
+        default_value_t = 500
     )]
     queue_reclaim_count: usize,
 
@@ -562,7 +576,8 @@ impl GatewayUsageArgs {
     fn to_config(&self) -> UsageRuntimeConfig {
         UsageRuntimeConfig {
             enabled: true,
-            queue_terminal_events: true,
+            queue_terminal_events: self.queue_terminal_events,
+            queue_lifecycle_events: self.queue_lifecycle_events,
             stream_key: self.queue_stream_key.trim().to_string(),
             consumer_group: self.queue_group.trim().to_string(),
             dlq_stream_key: self.queue_dlq_stream_key.trim().to_string(),
@@ -853,6 +868,13 @@ struct Args {
     #[arg(long, env = "AETHER_RUNTIME_REDIS_KEY_PREFIX")]
     runtime_redis_key_prefix: Option<String>,
 
+    #[arg(
+        long,
+        env = "AETHER_RUNTIME_COMMAND_TIMEOUT_MS",
+        default_value_t = 1_000
+    )]
+    runtime_command_timeout_ms: u64,
+
     #[command(flatten)]
     data: GatewayDataArgs,
 
@@ -932,6 +954,7 @@ impl Args {
         RuntimeStateConfig {
             backend: runtime_backend.to_runtime_state_backend(),
             redis,
+            command_timeout_ms: Some(self.runtime_command_timeout_ms.max(1)),
             ..RuntimeStateConfig::default()
         }
     }
@@ -1738,6 +1761,7 @@ mod tests {
             runtime_backend: None,
             runtime_redis_url: None,
             runtime_redis_key_prefix: None,
+            runtime_command_timeout_ms: 1_000,
             data: GatewayDataArgs {
                 database_driver: None,
                 database_url: None,
@@ -1754,14 +1778,16 @@ mod tests {
                 postgres_require_ssl: false,
             },
             usage: GatewayUsageArgs {
+                queue_terminal_events: true,
+                queue_lifecycle_events: true,
                 queue_stream_key: "usage:events".to_string(),
                 queue_group: "usage_consumers".to_string(),
                 queue_dlq_stream_key: "usage:events:dlq".to_string(),
-                queue_stream_maxlen: 2_000,
-                queue_batch_size: 200,
+                queue_stream_maxlen: 200_000,
+                queue_batch_size: 500,
                 queue_block_ms: 500,
                 queue_reclaim_idle_ms: 30_000,
-                queue_reclaim_count: 200,
+                queue_reclaim_count: 500,
                 queue_reclaim_interval_ms: 5_000,
             },
             frontdoor: GatewayFrontdoorArgs {

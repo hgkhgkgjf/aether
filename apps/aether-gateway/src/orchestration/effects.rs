@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
+use std::time::Duration;
 
 use aether_admin::provider::quota as admin_provider_quota_pure;
+use aether_cache::ExpiringMap;
 use aether_contracts::{ExecutionPlan, ExecutionTelemetry};
 use aether_data_contracts::repository::pool_scores::{
     PoolMemberHardState, PoolMemberIdentity, PoolMemberScheduleFeedback,
@@ -36,6 +39,30 @@ use crate::orchestration::local_execution_candidate_metadata_from_report_context
 use crate::scheduler::affinity::SCHEDULER_AFFINITY_TTL;
 use crate::scheduler::config::{read_scheduler_ordering_config, SchedulerSchedulingMode};
 use crate::AppState;
+
+const POOL_SCORE_FEEDBACK_GATE_MAX_ENTRIES: usize = 50_000;
+const POOL_SCORE_SUCCESS_FEEDBACK_MIN_INTERVAL_ENV: &str =
+    "AETHER_GATEWAY_POOL_SCORE_SUCCESS_FEEDBACK_MIN_INTERVAL_SECS";
+const POOL_SCORE_FAILURE_FEEDBACK_MIN_INTERVAL_ENV: &str =
+    "AETHER_GATEWAY_POOL_SCORE_FAILURE_FEEDBACK_MIN_INTERVAL_SECS";
+const DEFAULT_POOL_SCORE_SUCCESS_FEEDBACK_MIN_INTERVAL_SECS: u64 = 5;
+const DEFAULT_POOL_SCORE_FAILURE_FEEDBACK_MIN_INTERVAL_SECS: u64 = 1;
+const MAX_POOL_SCORE_FEEDBACK_MIN_INTERVAL_SECS: u64 = 300;
+
+static POOL_SCORE_FEEDBACK_GATE: LazyLock<ExpiringMap<String, ()>> =
+    LazyLock::new(ExpiringMap::new);
+static POOL_SCORE_SUCCESS_FEEDBACK_MIN_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
+    pool_score_feedback_interval_from_env(
+        POOL_SCORE_SUCCESS_FEEDBACK_MIN_INTERVAL_ENV,
+        DEFAULT_POOL_SCORE_SUCCESS_FEEDBACK_MIN_INTERVAL_SECS,
+    )
+});
+static POOL_SCORE_FAILURE_FEEDBACK_MIN_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
+    pool_score_feedback_interval_from_env(
+        POOL_SCORE_FAILURE_FEEDBACK_MIN_INTERVAL_ENV,
+        DEFAULT_POOL_SCORE_FAILURE_FEEDBACK_MIN_INTERVAL_SECS,
+    )
+});
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LocalExecutionEffectContext<'a> {
@@ -518,6 +545,14 @@ async fn record_adaptive_success_effect(
     else {
         return;
     };
+    if current_key.rpm_limit.is_some()
+        || current_key
+            .learned_rpm_limit
+            .filter(|value| *value > 0)
+            .is_none()
+    {
+        return;
+    }
     let Some(recent_candidates) = state
         .read_recent_request_candidates(ADAPTIVE_RPM_RECENT_CANDIDATE_LIMIT)
         .await
@@ -960,6 +995,9 @@ async fn record_pool_score_schedule_feedback(
     if context.plan.provider_id.trim().is_empty() || context.plan.key_id.trim().is_empty() {
         return;
     }
+    if !pool_score_feedback_gate_allows(context.plan, succeeded, hard_state, score_delta) {
+        return;
+    }
     let feedback = PoolMemberScheduleFeedback {
         identity: PoolMemberIdentity::provider_api_key(
             context.plan.provider_id.clone(),
@@ -984,6 +1022,64 @@ async fn record_pool_score_schedule_feedback(
             "gateway orchestration effects: failed to record pool score schedule feedback"
         );
     }
+}
+
+fn pool_score_feedback_interval_from_env(key: &str, default_secs: u64) -> Duration {
+    let secs = std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(default_secs)
+        .min(MAX_POOL_SCORE_FEEDBACK_MIN_INTERVAL_SECS);
+    Duration::from_secs(secs)
+}
+
+fn pool_score_feedback_min_interval(succeeded: Option<bool>) -> Duration {
+    match succeeded {
+        Some(false) => *POOL_SCORE_FAILURE_FEEDBACK_MIN_INTERVAL,
+        _ => *POOL_SCORE_SUCCESS_FEEDBACK_MIN_INTERVAL,
+    }
+}
+
+fn pool_score_feedback_gate_key(
+    plan: &ExecutionPlan,
+    succeeded: Option<bool>,
+    hard_state: Option<PoolMemberHardState>,
+    score_delta: Option<i32>,
+) -> String {
+    let succeeded = match succeeded {
+        Some(true) => "success",
+        Some(false) => "failure",
+        None => "neutral",
+    };
+    let hard_state = hard_state
+        .map(PoolMemberHardState::as_database)
+        .unwrap_or("none");
+    format!(
+        "provider:{}:key:{}:result:{}:state:{}:delta:{}",
+        plan.provider_id,
+        plan.key_id,
+        succeeded,
+        hard_state,
+        score_delta.unwrap_or_default()
+    )
+}
+
+fn pool_score_feedback_gate_allows(
+    plan: &ExecutionPlan,
+    succeeded: Option<bool>,
+    hard_state: Option<PoolMemberHardState>,
+    score_delta: Option<i32>,
+) -> bool {
+    let min_interval = pool_score_feedback_min_interval(succeeded);
+    if min_interval.is_zero() {
+        return true;
+    }
+    let key = pool_score_feedback_gate_key(plan, succeeded, hard_state, score_delta);
+    if POOL_SCORE_FEEDBACK_GATE.contains_fresh(&key, min_interval) {
+        return false;
+    }
+    POOL_SCORE_FEEDBACK_GATE.insert(key, (), min_interval, POOL_SCORE_FEEDBACK_GATE_MAX_ENTRIES);
+    true
 }
 
 fn pool_score_hard_state_for_status(
@@ -1057,10 +1153,10 @@ mod tests {
 
     use super::{
         apply_local_execution_effect, local_candidate_failure_should_record_pool_error,
-        pool_score_hard_state_for_status, LocalAdaptiveRateLimitEffect, LocalAdaptiveSuccessEffect,
-        LocalAttemptFailureEffect, LocalExecutionEffect, LocalExecutionEffectContext,
-        LocalHealthFailureEffect, LocalHealthSuccessEffect, LocalOAuthInvalidationEffect,
-        LocalPoolErrorEffect,
+        pool_score_feedback_gate_allows, pool_score_hard_state_for_status,
+        LocalAdaptiveRateLimitEffect, LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect,
+        LocalExecutionEffect, LocalExecutionEffectContext, LocalHealthFailureEffect,
+        LocalHealthSuccessEffect, LocalOAuthInvalidationEffect, LocalPoolErrorEffect,
     };
     use crate::data::{GatewayDataConfig, GatewayDataState};
     use crate::orchestration::LocalFailoverClassification;
@@ -1105,6 +1201,31 @@ mod tests {
             transport_profile: None,
             timeouts: None,
         }
+    }
+
+    #[test]
+    fn pool_score_feedback_gate_suppresses_repeated_success_writes() {
+        super::POOL_SCORE_FEEDBACK_GATE.clear();
+        let plan = sample_plan();
+
+        assert!(pool_score_feedback_gate_allows(
+            &plan,
+            Some(true),
+            Some(PoolMemberHardState::Available),
+            Some(50),
+        ));
+        assert!(!pool_score_feedback_gate_allows(
+            &plan,
+            Some(true),
+            Some(PoolMemberHardState::Available),
+            Some(50),
+        ));
+        assert!(pool_score_feedback_gate_allows(
+            &plan,
+            Some(false),
+            Some(PoolMemberHardState::Cooldown),
+            Some(-500),
+        ));
     }
 
     fn session_affinity() -> ClientSessionAffinity {
@@ -2075,7 +2196,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_invalidation_ignores_generic_codex_403() {
+    async fn oauth_invalidation_marks_generic_codex_403_as_token_invalid() {
         let state = codex_state();
         let plan = sample_codex_plan();
 
@@ -2099,8 +2220,20 @@ mod tests {
             .into_iter()
             .next()
             .expect("stored key should exist");
-        assert_eq!(stored_key.oauth_invalid_at_unix_secs, None);
-        assert_eq!(stored_key.oauth_invalid_reason, None);
+        assert!(stored_key.oauth_invalid_at_unix_secs.is_some());
+        assert_eq!(
+            stored_key.oauth_invalid_reason.as_deref(),
+            Some("[OAUTH_EXPIRED] Codex Token 已失效 (403): forbidden")
+        );
+        assert_eq!(
+            stored_key
+                .status_snapshot
+                .as_ref()
+                .and_then(|value| value.get("oauth"))
+                .and_then(|value| value.get("code"))
+                .and_then(Value::as_str),
+            Some("invalid")
+        );
     }
 
     #[tokio::test]

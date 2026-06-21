@@ -18,7 +18,7 @@ use aether_scheduler_core::{
 use aether_usage_runtime::{
     build_lifecycle_usage_seed, build_stream_terminal_usage_payload_seed,
     build_sync_terminal_usage_payload_seed, build_terminal_usage_context_seed, LifecycleUsageSeed,
-    UsageBodyCapturePolicy, UsageRequestRecordLevel, UsageRuntimeAccess,
+    UsageBodyCapturePolicy, UsageRequestRecordLevel,
     DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES,
 };
 use async_stream::stream;
@@ -2836,7 +2836,9 @@ async fn execute_stream_from_frame_stream(
     let emit_passthrough_sse_terminal_error = skip_direct_finalize_prefetch
         && response_headers_indicate_sse(&upstream_headers)
         && !is_openai_image_stream_for_report;
-    let body_capture_policy = match UsageRuntimeAccess::body_capture_policy(state.data.as_ref())
+    let body_capture_policy = match state
+        .usage_runtime
+        .body_capture_policy_for(state.data.as_ref())
         .await
     {
         Ok(policy) => policy,

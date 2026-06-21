@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::time::Instant;
 
 use super::auth::GatewayAuthApiKeySnapshot;
 use super::candidates::{read_request_candidate_trace, RequestCandidateTrace};
@@ -194,6 +196,24 @@ pub(crate) struct GatewayDataState {
     wallet_writer: Option<Arc<dyn WalletWriteRepository>>,
     settlement_writer: Option<Arc<dyn SettlementWriteRepository>>,
     system_config_values: Option<Arc<RwLock<BTreeMap<String, StoredSystemConfigEntry>>>>,
+    system_config_value_cache: Arc<RwLock<BTreeMap<String, (Instant, Option<serde_json::Value>)>>>,
+    billing_model_context_cache: Arc<
+        RwLock<HashMap<BillingModelContextCacheKey, (Instant, Option<StoredBillingModelContext>)>>,
+    >,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) enum BillingModelContextCacheKey {
+    ByModelId {
+        provider_id: String,
+        provider_api_key_id: Option<String>,
+        model_id: String,
+    },
+    ByGlobalModelName {
+        provider_id: String,
+        provider_api_key_id: Option<String>,
+        global_model_name: String,
+    },
 }
 
 impl fmt::Debug for GatewayDataState {
@@ -318,6 +338,7 @@ impl fmt::Debug for GatewayDataState {
 }
 
 mod auth;
+mod auth_api_key_cache;
 mod candidate_cache;
 mod catalog;
 mod core;
@@ -326,6 +347,8 @@ mod models;
 mod pool_scores;
 mod provider_catalog_cache;
 mod referrals;
+mod request_candidate_cache;
+mod routing_group_cache;
 mod routing_profiles;
 mod runtime;
 #[cfg(test)]

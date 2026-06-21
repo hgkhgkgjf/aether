@@ -79,6 +79,7 @@ pub struct HttpLoadProbeResult {
     pub mean_ms: u64,
     pub runtime: BenchmarkRuntimeSnapshot,
     pub status_counts: BTreeMap<u16, usize>,
+    pub error_counts: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
@@ -100,6 +101,7 @@ pub struct MultiUrlHttpLoadProbeResult {
     pub mean_ms: u64,
     pub runtime: BenchmarkRuntimeSnapshot,
     pub status_counts: BTreeMap<u16, usize>,
+    pub error_counts: BTreeMap<String, usize>,
 }
 
 pub async fn run_http_load_probe(
@@ -129,6 +131,7 @@ pub async fn run_http_load_probe(
             mean_ms: result.mean_ms,
             runtime: result.runtime,
             status_counts: result.status_counts,
+            error_counts: result.error_counts,
         })
 }
 
@@ -161,6 +164,7 @@ async fn run_http_load_probe_against_urls(
     let next_request = Arc::new(AtomicUsize::new(0));
     let latencies_ms = Arc::new(Mutex::new(Vec::with_capacity(config.total_requests)));
     let status_counts = Arc::new(Mutex::new(BTreeMap::<u16, usize>::new()));
+    let error_counts = Arc::new(Mutex::new(BTreeMap::<String, usize>::new()));
     let target_request_counts = Arc::new(Mutex::new(BTreeMap::<String, usize>::new()));
     let failed_requests = Arc::new(AtomicUsize::new(0));
     let completed_requests = Arc::new(AtomicUsize::new(0));
@@ -171,6 +175,7 @@ async fn run_http_load_probe_against_urls(
         let next_request = Arc::clone(&next_request);
         let latencies_ms = Arc::clone(&latencies_ms);
         let status_counts = Arc::clone(&status_counts);
+        let error_counts = Arc::clone(&error_counts);
         let target_request_counts = Arc::clone(&target_request_counts);
         let failed_requests = Arc::clone(&failed_requests);
         let completed_requests = Arc::clone(&completed_requests);
@@ -200,27 +205,33 @@ async fn run_http_load_probe_against_urls(
                         let status = response.status().as_u16();
                         let body_result = match response_mode {
                             HttpLoadProbeResponseMode::HeadersOnly => Ok(()),
-                            HttpLoadProbeResponseMode::FullBody => {
-                                response.bytes().await.map(|_| ()).map_err(|_| ())
-                            }
+                            HttpLoadProbeResponseMode::FullBody => response
+                                .bytes()
+                                .await
+                                .map(|_| ())
+                                .map_err(|err| classify_reqwest_error(&err)),
                         };
-                        if body_result.is_ok() {
+                        if let Err(error_kind) = body_result {
+                            failed_requests.fetch_add(1, Ordering::AcqRel);
+                            let mut counts = error_counts.lock().await;
+                            *counts.entry(error_kind).or_insert(0) += 1;
+                        } else {
                             let mut counts = status_counts.lock().await;
                             *counts.entry(status).or_insert(0) += 1;
                             drop(counts);
                             let mut target_counts = target_request_counts.lock().await;
                             *target_counts.entry(url).or_insert(0) += 1;
-                        } else {
-                            failed_requests.fetch_add(1, Ordering::AcqRel);
                         }
                         let latency_ms = started_at.elapsed().as_millis() as u64;
                         latencies_ms.lock().await.push(latency_ms);
                         completed_requests.fetch_add(1, Ordering::AcqRel);
                     }
-                    Err(_) => {
+                    Err(err) => {
                         let latency_ms = started_at.elapsed().as_millis() as u64;
                         latencies_ms.lock().await.push(latency_ms);
                         failed_requests.fetch_add(1, Ordering::AcqRel);
+                        let mut counts = error_counts.lock().await;
+                        *counts.entry(classify_reqwest_error(&err)).or_insert(0) += 1;
                         completed_requests.fetch_add(1, Ordering::AcqRel);
                     }
                 }
@@ -233,6 +244,7 @@ async fn run_http_load_probe_against_urls(
     }
 
     let status_counts = status_counts.lock().await.clone();
+    let error_counts = error_counts.lock().await.clone();
     let target_request_counts = target_request_counts.lock().await.clone();
     let mut latencies = latencies_ms.lock().await.clone();
     latencies.sort_unstable();
@@ -262,7 +274,30 @@ async fn run_http_load_probe_against_urls(
         mean_ms,
         runtime: runtime_sampler.snapshot(),
         status_counts,
+        error_counts,
     })
+}
+
+fn classify_reqwest_error(err: &reqwest::Error) -> String {
+    if err.is_timeout() {
+        return "timeout".to_string();
+    }
+    if err.is_connect() {
+        return "connect".to_string();
+    }
+    if err.is_body() {
+        return "body".to_string();
+    }
+    if err.is_request() {
+        return "request".to_string();
+    }
+    if err.is_decode() {
+        return "decode".to_string();
+    }
+    if err.is_redirect() {
+        return "redirect".to_string();
+    }
+    "other".to_string()
 }
 
 fn build_headers(headers: &BTreeMap<String, String>) -> Result<HeaderMap, String> {

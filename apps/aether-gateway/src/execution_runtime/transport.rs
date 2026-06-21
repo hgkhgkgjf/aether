@@ -1,8 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error as _;
 use std::future::Future;
 use std::io::Read;
 use std::io::Write;
+use std::sync::{LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use aether_contracts::{
@@ -45,6 +46,18 @@ const DEFAULT_STREAM_FIRST_BYTE_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_NON_STREAM_TOTAL_TIMEOUT_MS: u64 = 300_000;
 const MIN_TUNNEL_TIMEOUT_SECS: u64 = 1;
 const MAX_TUNNEL_TIMEOUT_SECS: u64 = 300;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DirectReqwestClientCacheKey {
+    connect_timeout_ms: Option<u64>,
+    follow_redirects: bool,
+    http1_only: bool,
+    accept_invalid_certs: bool,
+}
+
+static DIRECT_REQWEST_CLIENT_CACHE: LazyLock<
+    StdMutex<HashMap<DirectReqwestClientCacheKey, reqwest::Client>>,
+> = LazyLock::new(|| StdMutex::new(HashMap::new()));
 pub(crate) fn format_upstream_request_error(err: &reqwest::Error) -> String {
     let mut kinds = Vec::new();
     if err.is_connect() {
@@ -1352,6 +1365,28 @@ fn build_client(
     transport_controls: ExecutionTransportControls,
 ) -> Result<reqwest::Client, ExecutionRuntimeTransportError> {
     validate_reqwest_transport_profile(transport_profile)?;
+    let resolved_proxy_url = resolve_proxy_url(proxy)?;
+    if resolved_proxy_url.is_none() && transport_profile.is_none() {
+        let cache_key = DirectReqwestClientCacheKey {
+            connect_timeout_ms: timeouts.and_then(|timeouts| timeouts.connect_ms),
+            follow_redirects: transport_controls.follow_redirects == Some(true),
+            http1_only: transport_controls.http1_only,
+            accept_invalid_certs: transport_controls.accept_invalid_certs,
+        };
+        if let Ok(cache) = DIRECT_REQWEST_CLIENT_CACHE.lock() {
+            if let Some(client) = cache.get(&cache_key) {
+                return Ok(client.clone());
+            }
+        }
+
+        let client = build_plain_direct_reqwest_client(cache_key)?;
+        if let Ok(mut cache) = DIRECT_REQWEST_CLIENT_CACHE.lock() {
+            let client = cache.entry(cache_key).or_insert_with(|| client.clone());
+            return Ok(client.clone());
+        }
+        return Ok(client);
+    }
+
     let mut builder = reqwest::Client::builder();
     if transport_controls.follow_redirects != Some(true) {
         builder = builder.redirect(Policy::none());
@@ -1370,7 +1405,7 @@ fn build_client(
     if transport_controls.accept_invalid_certs {
         builder = builder.danger_accept_invalid_certs(true);
     }
-    if let Some(proxy_url) = resolve_proxy_url(proxy)? {
+    if let Some(proxy_url) = resolved_proxy_url {
         let proxy = reqwest::Proxy::all(&proxy_url)
             .map_err(ExecutionRuntimeTransportError::InvalidProxy)?;
         builder = builder.proxy(proxy);
@@ -1378,6 +1413,41 @@ fn build_client(
     builder
         .build()
         .map_err(ExecutionRuntimeTransportError::ClientBuild)
+}
+
+fn build_plain_direct_reqwest_client(
+    cache_key: DirectReqwestClientCacheKey,
+) -> Result<reqwest::Client, ExecutionRuntimeTransportError> {
+    let mut builder = reqwest::Client::builder();
+    if !cache_key.follow_redirects {
+        builder = builder.redirect(Policy::none());
+    }
+    if cache_key.http1_only {
+        builder = builder.http1_only();
+    }
+    let mut builder = apply_http_client_config(
+        builder,
+        &HttpClientConfig {
+            connect_timeout_ms: cache_key.connect_timeout_ms,
+            pool_max_idle_per_host: Some(direct_reqwest_pool_max_idle_per_host()),
+            ..HttpClientConfig::default()
+        },
+    );
+    if cache_key.accept_invalid_certs {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    builder
+        .build()
+        .map_err(ExecutionRuntimeTransportError::ClientBuild)
+}
+
+fn direct_reqwest_pool_max_idle_per_host() -> usize {
+    const DEFAULT_MAX_IDLE_PER_HOST: usize = 1024;
+    std::env::var("AETHER_GATEWAY_UPSTREAM_POOL_MAX_IDLE_PER_HOST")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_IDLE_PER_HOST)
 }
 
 pub(crate) fn build_browser_wreq_client(

@@ -5,8 +5,8 @@ use super::{
     AdminBillingRuleWriteInput, AdminPaymentOrderListQuery, AdminRedeemCodeBatchListQuery,
     AdminRedeemCodeListQuery, AdminWalletLedgerQuery, AdminWalletListQuery,
     AdminWalletRefundRequestListQuery, AnnouncementListQuery, AuditLogListQuery,
-    BackgroundTaskListQuery, BackgroundTaskSummary, BillingPlanRecord, BillingPlanWriteInput,
-    CompleteAdminWalletRefundInput, CreateAdminRedeemCodeBatchInput,
+    BackgroundTaskListQuery, BackgroundTaskSummary, BillingModelContextCacheKey, BillingPlanRecord,
+    BillingPlanWriteInput, CompleteAdminWalletRefundInput, CreateAdminRedeemCodeBatchInput,
     CreateAdminRedeemCodeBatchResult, CreateAnnouncementRecord, CreateManualWalletRechargeInput,
     CreatePlanPurchaseOrderInput, CreatePlanPurchaseOrderOutcome, CreateWalletRechargeOrderInput,
     CreateWalletRechargeOrderOutcome, CreateWalletRefundRequestInput,
@@ -44,9 +44,23 @@ use aether_runtime_state::RuntimeQueueStore;
 use aether_video_tasks_core::read_data_backed_video_task_response;
 use std::time::{Duration, Instant};
 
+fn normalize_billing_context_cache_part(value: &str) -> String {
+    value.trim().to_string()
+}
+
+fn normalize_optional_billing_context_cache_part(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 impl GatewayDataState {
-    const MAINTENANCE_POOL_IDLE_RESERVE: usize = 1;
+    const MAINTENANCE_POOL_IDLE_RESERVE_ENV: &'static str =
+        "AETHER_GATEWAY_MAINTENANCE_POOL_IDLE_RESERVE";
     const MAINTENANCE_POOL_PRESSURE_MAX_DEFER: Duration = Duration::from_secs(30);
+    const BILLING_MODEL_CONTEXT_CACHE_TTL: Duration = Duration::from_secs(30);
+    const BILLING_MODEL_CONTEXT_CACHE_MAX_ENTRIES: usize = 4096;
 
     pub(crate) async fn run_database_maintenance(
         &self,
@@ -125,7 +139,26 @@ impl GatewayDataState {
     pub(crate) fn database_pool_summary_under_maintenance_pressure(
         summary: &aether_data::DatabasePoolSummary,
     ) -> bool {
-        summary.checked_out > 0 && summary.idle <= Self::MAINTENANCE_POOL_IDLE_RESERVE
+        summary.checked_out > 0 && summary.idle <= Self::maintenance_pool_idle_reserve(summary)
+    }
+
+    pub(crate) fn maintenance_pool_idle_reserve(
+        summary: &aether_data::DatabasePoolSummary,
+    ) -> usize {
+        if let Some(override_value) = std::env::var(Self::MAINTENANCE_POOL_IDLE_RESERVE_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+        {
+            return override_value;
+        }
+
+        let max_connections = summary.max_connections as usize;
+        if max_connections == 0 {
+            return 0;
+        }
+
+        let ten_percent_ceil = (max_connections + 9) / 10;
+        ten_percent_ceil.clamp(2, 10).min(max_connections)
     }
 
     pub(crate) fn should_defer_maintenance_for_database_pool_pressure(
@@ -1615,15 +1648,14 @@ impl GatewayDataState {
         &self,
         user_id: &str,
     ) -> Result<Option<serde_json::Value>, DataLayerError> {
+        let user_id = user_id.trim();
+        if user_id.is_empty() {
+            return Ok(None);
+        }
         if let Some(user) = self.find_export_user_by_id(user_id).await? {
             return Ok(user.feature_settings);
         }
-        Ok(self
-            .list_non_admin_export_users()
-            .await?
-            .into_iter()
-            .find(|user| user.id == user_id)
-            .and_then(|user| user.feature_settings))
+        Ok(None)
     }
 
     pub(crate) async fn list_non_admin_export_users(
@@ -1670,13 +1702,26 @@ impl GatewayDataState {
         provider_api_key_id: Option<&str>,
         global_model_name: &str,
     ) -> Result<Option<StoredBillingModelContext>, DataLayerError> {
+        let key = BillingModelContextCacheKey::ByGlobalModelName {
+            provider_id: normalize_billing_context_cache_part(provider_id),
+            provider_api_key_id: normalize_optional_billing_context_cache_part(provider_api_key_id),
+            global_model_name: normalize_billing_context_cache_part(global_model_name),
+        };
+        if let Some(value) = self.cached_billing_model_context(&key) {
+            return Ok(value);
+        }
         match &self.billing_reader {
             Some(repository) => {
-                repository
+                let value = repository
                     .find_model_context(provider_id, provider_api_key_id, global_model_name)
-                    .await
+                    .await?;
+                self.remember_billing_model_context(key, value.clone());
+                Ok(value)
             }
-            None => Ok(None),
+            None => {
+                self.remember_billing_model_context(key, None);
+                Ok(None)
+            }
         }
     }
 
@@ -1686,14 +1731,72 @@ impl GatewayDataState {
         provider_api_key_id: Option<&str>,
         model_id: &str,
     ) -> Result<Option<StoredBillingModelContext>, DataLayerError> {
+        let key = BillingModelContextCacheKey::ByModelId {
+            provider_id: normalize_billing_context_cache_part(provider_id),
+            provider_api_key_id: normalize_optional_billing_context_cache_part(provider_api_key_id),
+            model_id: normalize_billing_context_cache_part(model_id),
+        };
+        if let Some(value) = self.cached_billing_model_context(&key) {
+            return Ok(value);
+        }
         match &self.billing_reader {
             Some(repository) => {
-                repository
+                let value = repository
                     .find_model_context_by_model_id(provider_id, provider_api_key_id, model_id)
-                    .await
+                    .await?;
+                self.remember_billing_model_context(key, value.clone());
+                Ok(value)
             }
-            None => Ok(None),
+            None => {
+                self.remember_billing_model_context(key, None);
+                Ok(None)
+            }
         }
+    }
+
+    fn cached_billing_model_context(
+        &self,
+        key: &BillingModelContextCacheKey,
+    ) -> Option<Option<StoredBillingModelContext>> {
+        self.billing_model_context_cache
+            .read()
+            .expect("billing model context cache lock")
+            .get(key)
+            .and_then(|(cached_at, value)| {
+                (cached_at.elapsed() <= Self::BILLING_MODEL_CONTEXT_CACHE_TTL)
+                    .then(|| value.clone())
+            })
+    }
+
+    fn remember_billing_model_context(
+        &self,
+        key: BillingModelContextCacheKey,
+        value: Option<StoredBillingModelContext>,
+    ) {
+        let mut cache = self
+            .billing_model_context_cache
+            .write()
+            .expect("billing model context cache lock");
+        cache.retain(|_, (cached_at, _)| {
+            cached_at.elapsed() <= Self::BILLING_MODEL_CONTEXT_CACHE_TTL
+        });
+        if cache.len() >= Self::BILLING_MODEL_CONTEXT_CACHE_MAX_ENTRIES {
+            if let Some(oldest_key) = cache
+                .iter()
+                .min_by_key(|(_, (cached_at, _))| *cached_at)
+                .map(|(key, _)| key.clone())
+            {
+                cache.remove(&oldest_key);
+            }
+        }
+        cache.insert(key, (Instant::now(), value));
+    }
+
+    fn clear_billing_model_context_cache(&self) {
+        self.billing_model_context_cache
+            .write()
+            .expect("billing model context cache lock")
+            .clear();
     }
 
     pub(crate) async fn admin_billing_enabled_default_value_exists(
@@ -1722,10 +1825,14 @@ impl GatewayDataState {
         &self,
         input: &AdminBillingRuleWriteInput,
     ) -> Result<AdminBillingMutationOutcome<AdminBillingRuleRecord>, DataLayerError> {
-        match &self.billing_reader {
+        let result = match &self.billing_reader {
             Some(repository) => repository.create_admin_billing_rule(input).await,
             None => Ok(AdminBillingMutationOutcome::Unavailable),
+        };
+        if result.is_ok() {
+            self.clear_billing_model_context_cache();
         }
+        result
     }
 
     pub(crate) async fn list_admin_billing_rules(
@@ -1760,20 +1867,28 @@ impl GatewayDataState {
         rule_id: &str,
         input: &AdminBillingRuleWriteInput,
     ) -> Result<AdminBillingMutationOutcome<AdminBillingRuleRecord>, DataLayerError> {
-        match &self.billing_reader {
+        let result = match &self.billing_reader {
             Some(repository) => repository.update_admin_billing_rule(rule_id, input).await,
             None => Ok(AdminBillingMutationOutcome::Unavailable),
+        };
+        if result.is_ok() {
+            self.clear_billing_model_context_cache();
         }
+        result
     }
 
     pub(crate) async fn create_admin_billing_collector(
         &self,
         input: &AdminBillingCollectorWriteInput,
     ) -> Result<AdminBillingMutationOutcome<AdminBillingCollectorRecord>, DataLayerError> {
-        match &self.billing_reader {
+        let result = match &self.billing_reader {
             Some(repository) => repository.create_admin_billing_collector(input).await,
             None => Ok(AdminBillingMutationOutcome::Unavailable),
+        };
+        if result.is_ok() {
+            self.clear_billing_model_context_cache();
         }
+        result
     }
 
     pub(crate) async fn list_admin_billing_collectors(
@@ -1817,14 +1932,18 @@ impl GatewayDataState {
         collector_id: &str,
         input: &AdminBillingCollectorWriteInput,
     ) -> Result<AdminBillingMutationOutcome<AdminBillingCollectorRecord>, DataLayerError> {
-        match &self.billing_reader {
+        let result = match &self.billing_reader {
             Some(repository) => {
                 repository
                     .update_admin_billing_collector(collector_id, input)
                     .await
             }
             None => Ok(AdminBillingMutationOutcome::Unavailable),
+        };
+        if result.is_ok() {
+            self.clear_billing_model_context_cache();
         }
+        result
     }
 
     pub(crate) async fn apply_admin_billing_preset(
@@ -1833,14 +1952,18 @@ impl GatewayDataState {
         mode: &str,
         collectors: &[AdminBillingCollectorWriteInput],
     ) -> Result<AdminBillingMutationOutcome<AdminBillingPresetApplyResult>, DataLayerError> {
-        match &self.billing_reader {
+        let result = match &self.billing_reader {
             Some(repository) => {
                 repository
                     .apply_admin_billing_preset(preset, mode, collectors)
                     .await
             }
             None => Ok(AdminBillingMutationOutcome::Unavailable),
+        };
+        if result.is_ok() {
+            self.clear_billing_model_context_cache();
         }
+        result
     }
 
     pub(crate) async fn find_payment_gateway_config(

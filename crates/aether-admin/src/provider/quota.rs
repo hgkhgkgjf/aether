@@ -1056,8 +1056,20 @@ pub fn codex_runtime_invalid_reason(
         {
             Some(codex_structured_invalid_reason(403, upstream_message))
         }
+        403 => Some(codex_generic_forbidden_runtime_invalid_reason(
+            upstream_message,
+        )),
         _ => None,
     }
+}
+
+fn codex_generic_forbidden_runtime_invalid_reason(upstream_message: Option<&str>) -> String {
+    let detail = upstream_message
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|message| format!("Codex Token 已失效 (403): {message}"))
+        .unwrap_or_else(|| "Codex Token 已失效 (403)".to_string());
+    format!("{OAUTH_EXPIRED_PREFIX}{detail}")
 }
 
 pub fn codex_soft_request_failure_reason(
@@ -1808,8 +1820,13 @@ mod tests {
     }
 
     #[test]
-    fn codex_runtime_invalid_reason_ignores_generic_403() {
-        assert_eq!(codex_runtime_invalid_reason(403, Some("forbidden")), None);
+    fn codex_runtime_invalid_reason_marks_generic_403_as_token_invalid() {
+        assert_eq!(
+            codex_runtime_invalid_reason(403, Some("forbidden")),
+            Some(format!(
+                "{OAUTH_EXPIRED_PREFIX}Codex Token 已失效 (403): forbidden"
+            ))
+        );
     }
 
     #[test]
