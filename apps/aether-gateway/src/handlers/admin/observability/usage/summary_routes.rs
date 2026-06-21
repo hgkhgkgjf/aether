@@ -583,6 +583,7 @@ fn build_admin_usage_keyword_search_query(
         client_family: base_query.client_family.clone(),
         exclude_unknown_model_or_provider: base_query.exclude_unknown_model_or_provider,
         statuses: base_query.statuses.clone(),
+        exclude_status_codes: base_query.exclude_status_codes.clone(),
         is_stream: base_query.is_stream,
         error_only: base_query.error_only,
         keywords,

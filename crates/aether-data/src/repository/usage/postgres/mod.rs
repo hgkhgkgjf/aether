@@ -86,6 +86,24 @@ fn dashboard_utc_to_unix_secs(value: DateTime<Utc>) -> u64 {
     value.timestamp().max(0) as u64
 }
 
+fn push_postgres_usage_excluded_status_codes(
+    builder: &mut QueryBuilder<'_, Postgres>,
+    has_where: &mut bool,
+    status_codes: &[u16],
+) {
+    if status_codes.is_empty() {
+        return;
+    }
+    builder.push(if *has_where { " AND " } else { " WHERE " });
+    *has_where = true;
+    builder.push("(\"usage\".status_code IS NULL OR \"usage\".status_code NOT IN (");
+    let mut separated = builder.separated(", ");
+    for status_code in status_codes {
+        separated.push_bind(i32::from(*status_code));
+    }
+    separated.push_unseparated("))");
+}
+
 fn dashboard_utc_midnight(value: DateTime<Utc>) -> DateTime<Utc> {
     DateTime::<Utc>::from_naive_utc_and_offset(
         value
@@ -2631,6 +2649,11 @@ ORDER BY request_count DESC, "usage".provider_name ASC
                 separated.push_unseparated(")");
             }
         }
+        push_postgres_usage_excluded_status_codes(
+            &mut builder,
+            &mut has_where,
+            &query.exclude_status_codes,
+        );
         if let Some(is_stream) = query.is_stream {
             builder.push(if has_where { " AND " } else { " WHERE " });
             has_where = true;
@@ -2738,6 +2761,11 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
                 separated.push_unseparated(")");
             }
         }
+        push_postgres_usage_excluded_status_codes(
+            &mut builder,
+            &mut has_where,
+            &query.exclude_status_codes,
+        );
         if let Some(is_stream) = query.is_stream {
             builder.push(if has_where { " AND " } else { " WHERE " });
             has_where = true;
@@ -2926,6 +2954,11 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
                 separated.push_unseparated(")");
             }
         }
+        push_postgres_usage_excluded_status_codes(
+            &mut builder,
+            &mut has_where,
+            &query.exclude_status_codes,
+        );
         if let Some(is_stream) = query.is_stream {
             builder.push(if has_where { " AND " } else { " WHERE " });
             has_where = true;
@@ -3022,6 +3055,11 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
                 separated.push_unseparated(")");
             }
         }
+        push_postgres_usage_excluded_status_codes(
+            &mut builder,
+            &mut has_where,
+            &query.exclude_status_codes,
+        );
         if let Some(is_stream) = query.is_stream {
             builder.push(if has_where { " AND " } else { " WHERE " });
             has_where = true;
@@ -4897,6 +4935,23 @@ WITH filtered_usage AS (
                 .push("\"usage\".provider_name = ")
                 .push_bind(provider_name.to_string());
         }
+        if let Some(model) = query.model.as_deref() {
+            builder.push(if has_where { " AND " } else { " WHERE " });
+            builder
+                .push("\"usage\".model = ")
+                .push_bind(model.to_string());
+        }
+        if let Some(api_format) = query.api_format.as_deref() {
+            builder.push(if has_where { " AND " } else { " WHERE " });
+            builder
+                .push("\"usage\".api_format = ")
+                .push_bind(api_format.to_string());
+        }
+        push_postgres_usage_excluded_status_codes(
+            &mut builder,
+            &mut has_where,
+            &query.exclude_status_codes,
+        );
         builder.push(filtered_extra_where);
         builder.push(
             r#"
@@ -4989,7 +5044,16 @@ ORDER BY request_count DESC, group_key ASC
         &self,
         query: &UsageBreakdownSummaryQuery,
     ) -> Result<Vec<StoredUsageBreakdownSummaryRow>, DataLayerError> {
+        if !query.exclude_status_codes.is_empty() {
+            return self.summarize_usage_breakdown_raw(query).await;
+        }
         if query.provider_name.is_some() {
+            return self.summarize_usage_breakdown_raw(query).await;
+        }
+        if query.model.is_some() {
+            return self.summarize_usage_breakdown_raw(query).await;
+        }
+        if query.api_format.is_some() {
             return self.summarize_usage_breakdown_raw(query).await;
         }
         let Some(user_id) = query.user_id.as_deref() else {
@@ -5014,6 +5078,9 @@ ORDER BY request_count DESC, group_key ASC
                     created_until_unix_secs: dashboard_utc_to_unix_secs(raw_end),
                     user_id: Some(user_id.to_string()),
                     provider_name: None,
+                    model: None,
+                    api_format: None,
+                    exclude_status_codes: query.exclude_status_codes.clone(),
                     group_by: query.group_by,
                 })
                 .await?;
@@ -5037,6 +5104,9 @@ ORDER BY request_count DESC, group_key ASC
                     created_until_unix_secs: dashboard_utc_to_unix_secs(raw_end),
                     user_id: Some(user_id.to_string()),
                     provider_name: None,
+                    model: None,
+                    api_format: None,
+                    exclude_status_codes: query.exclude_status_codes.clone(),
                     group_by: query.group_by,
                 })
                 .await?;

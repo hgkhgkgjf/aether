@@ -57,6 +57,7 @@ export interface CacheStats {
 export interface UserStats {
   total: number
   active: number
+  online?: number
 }
 
 // Token 详细分类

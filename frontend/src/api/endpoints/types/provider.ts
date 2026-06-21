@@ -563,6 +563,20 @@ export interface EndpointHealthEvent {
   error_message?: string | null
 }
 
+export interface HealthTimelineDetail {
+  segment_index?: number
+  status?: string
+  time_range_start?: string | null
+  time_range_end?: string | null
+  total_attempts?: number | null
+  success_count?: number | null
+  failed_count?: number | null
+  success_rate?: number | null
+  avg_latency_ms?: number | null
+  avg_first_byte_ms?: number | null
+  avg_tps?: number | null
+}
+
 export interface EndpointStatusMonitor {
   api_format: string
   total_attempts: number
@@ -570,11 +584,15 @@ export interface EndpointStatusMonitor {
   failed_count: number
   skipped_count: number
   success_rate: number
+  avg_latency_ms?: number | null
+  avg_first_byte_ms?: number | null
+  avg_tps?: number | null
   provider_count: number
   key_count: number
   last_event_at?: string | null
   events: EndpointHealthEvent[]
   timeline?: string[]
+  timeline_details?: HealthTimelineDetail[]
   time_range_start?: string | null
   time_range_end?: string | null
 }
@@ -602,9 +620,13 @@ export interface PublicEndpointStatusMonitor {
   failed_count: number
   skipped_count: number
   success_rate: number
+  avg_latency_ms?: number | null
+  avg_first_byte_ms?: number | null
+  avg_tps?: number | null
   last_event_at?: string | null
   events: PublicHealthEvent[]
   timeline?: string[]
+  timeline_details?: HealthTimelineDetail[]
   time_range_start?: string | null
   time_range_end?: string | null
 }
@@ -632,10 +654,12 @@ export interface ModelStatusMonitor {
   success_rate: number
   avg_latency_ms?: number | null
   avg_first_byte_ms?: number | null
+  avg_tps?: number | null
   provider_count?: number
   last_event_at?: string | null
   events: ModelHealthEvent[]
   timeline?: string[]
+  timeline_details?: HealthTimelineDetail[]
   time_range_start?: string | null
   time_range_end?: string | null
 }
@@ -656,9 +680,11 @@ export interface ProviderStatusMonitor {
   success_rate: number
   avg_latency_ms?: number | null
   avg_first_byte_ms?: number | null
+  avg_tps?: number | null
   model_count: number
   last_event_at?: string | null
   timeline?: string[]
+  timeline_details?: HealthTimelineDetail[]
   time_range_start?: string | null
   time_range_end?: string | null
   models: ModelStatusMonitor[]
@@ -667,6 +693,36 @@ export interface ProviderStatusMonitor {
 export interface ProviderStatusMonitorResponse {
   generated_at: string
   providers: ProviderStatusMonitor[]
+}
+
+export type HealthMonitorRelatedDimension = 'endpoint' | 'model' | 'provider'
+
+export interface HealthRelatedMonitor {
+  kind: HealthMonitorRelatedDimension
+  key: string
+  display_name: string
+  meta_text?: string | null
+  total_attempts: number
+  success_count: number
+  failed_count: number
+  success_rate: number
+  avg_latency_ms?: number | null
+  avg_first_byte_ms?: number | null
+  avg_tps?: number | null
+  last_event_at?: string | null
+  timeline?: string[]
+  timeline_details?: HealthTimelineDetail[]
+  time_range_start?: string | null
+  time_range_end?: string | null
+}
+
+export interface HealthRelatedMonitorResponse {
+  generated_at: string
+  dimension: HealthMonitorRelatedDimension
+  value: string
+  related_endpoints: HealthRelatedMonitor[]
+  related_models: HealthRelatedMonitor[]
+  related_providers: HealthRelatedMonitor[]
 }
 
 export type ProviderType = 'custom' | 'claude_code' | 'codex' | 'chatgpt_web' | 'gemini_cli' | 'antigravity' | 'kiro' | 'grok' | 'windsurf' | 'vertex_ai'
