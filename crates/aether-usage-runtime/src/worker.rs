@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -5,6 +6,7 @@ use aether_data_contracts::repository::usage::{StoredRequestUsageAudit, UpsertUs
 use aether_data_contracts::DataLayerError;
 use aether_runtime_state::{RuntimeQueueEntry, RuntimeQueueStore};
 use async_trait::async_trait;
+use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::executor::spawn_on_usage_background_runtime;
@@ -69,7 +71,32 @@ pub struct UsageQueueWorker {
     queue: UsageQueue,
     recorder: Arc<dyn UsageEventRecorder>,
     consumer: String,
+    worker_index: Option<usize>,
+    control: Option<UsageWorkerControl>,
+    telemetry: Option<mpsc::Sender<UsageWorkerObservation>>,
     config: UsageRuntimeConfig,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct UsageWorkerControl {
+    shutdown: Arc<AtomicBool>,
+}
+
+impl UsageWorkerControl {
+    pub(crate) fn request_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+    }
+
+    fn should_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UsageWorkerObservation {
+    pub worker_index: Option<usize>,
+    pub entries_read: usize,
+    pub batch_size: usize,
 }
 
 impl UsageQueueWorker {
@@ -77,19 +104,37 @@ impl UsageQueueWorker {
         runner: Arc<dyn RuntimeQueueStore>,
         recorder: Arc<dyn UsageEventRecorder>,
         config: UsageRuntimeConfig,
+        worker_index: Option<usize>,
     ) -> Result<Self, DataLayerError> {
         let queue = UsageQueue::new(runner, config.clone())?;
-        let consumer = consumer_name();
+        let consumer = consumer_name(worker_index);
         Ok(Self {
             queue,
             recorder,
             consumer,
+            worker_index,
+            control: None,
+            telemetry: None,
             config,
         })
     }
 
+    pub(crate) fn with_supervisor(
+        mut self,
+        control: UsageWorkerControl,
+        telemetry: mpsc::Sender<UsageWorkerObservation>,
+    ) -> Self {
+        self.control = Some(control);
+        self.telemetry = Some(telemetry);
+        self
+    }
+
     pub fn spawn(self) -> tokio::task::JoinHandle<()> {
         spawn_on_usage_background_runtime(async move { self.run_forever().await })
+    }
+
+    pub(crate) async fn run(self) {
+        self.run_forever().await;
     }
 
     async fn run_forever(self) {
@@ -111,6 +156,9 @@ impl UsageQueueWorker {
         reclaim_interval.tick().await;
 
         loop {
+            if self.should_shutdown() {
+                break;
+            }
             tokio::select! {
                 _ = reclaim_interval.tick() => {
                     match self.queue.claim_stale(&self.consumer, "0-0").await {
@@ -139,6 +187,10 @@ impl UsageQueueWorker {
                 result = self.queue.read_group(&self.consumer) => {
                     match result {
                         Ok(entries) => {
+                            self.report_read(entries.len());
+                            if entries.is_empty() && self.should_shutdown() {
+                                break;
+                            }
                             if let Err(err) = self.process_entries(entries).await {
                                 warn!(
                                     event_name = "usage_worker_process_failed",
@@ -149,6 +201,9 @@ impl UsageQueueWorker {
                                     "usage worker failed to process queue entries"
                                 );
                                 tokio::time::sleep(Duration::from_millis(250)).await;
+                            }
+                            if self.should_shutdown() {
+                                break;
                             }
                         }
                         Err(err) => {
@@ -166,6 +221,23 @@ impl UsageQueueWorker {
                 }
             }
         }
+    }
+
+    fn should_shutdown(&self) -> bool {
+        self.control
+            .as_ref()
+            .is_some_and(UsageWorkerControl::should_shutdown)
+    }
+
+    fn report_read(&self, entries_read: usize) {
+        let Some(telemetry) = &self.telemetry else {
+            return;
+        };
+        let _ = telemetry.try_send(UsageWorkerObservation {
+            worker_index: self.worker_index,
+            entries_read,
+            batch_size: self.config.consumer_batch_size.max(1),
+        });
     }
 
     async fn process_entries(&self, entries: Vec<RuntimeQueueEntry>) -> Result<(), DataLayerError> {
@@ -282,6 +354,7 @@ pub fn build_usage_queue_worker<T>(
     runner: Arc<dyn RuntimeQueueStore>,
     data: Arc<T>,
     config: UsageRuntimeConfig,
+    worker_index: Option<usize>,
 ) -> Result<UsageQueueWorker, DataLayerError>
 where
     T: UsageRecordWriter
@@ -292,7 +365,12 @@ where
         + Sync
         + 'static,
 {
-    UsageQueueWorker::new(runner, Arc::new(UsageDataEventRecorder::new(data)), config)
+    UsageQueueWorker::new(
+        runner,
+        Arc::new(UsageDataEventRecorder::new(data)),
+        config,
+        worker_index,
+    )
 }
 
 pub async fn write_event_record<T>(data: &T, event: &UsageEvent) -> Result<(), DataLayerError>
@@ -380,13 +458,16 @@ fn extract_manual_proxy_node_id(event: &UsageEvent) -> Option<String> {
         .map(String::from)
 }
 
-fn consumer_name() -> String {
+fn consumer_name(worker_index: Option<usize>) -> String {
     let host = std::env::var("HOSTNAME")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "aether-gateway".to_string());
-    format!("{host}:{}", std::process::id())
+    match worker_index {
+        Some(worker_index) => format!("{host}:{}:{worker_index}", std::process::id()),
+        None => format!("{host}:{}", std::process::id()),
+    }
 }
 
 #[cfg(test)]
@@ -662,7 +743,7 @@ mod tests {
             consumer_block_ms: 1,
             ..UsageRuntimeConfig::default()
         };
-        let worker = UsageQueueWorker::new(queue_runner, recorder.clone(), config)
+        let worker = UsageQueueWorker::new(queue_runner, recorder.clone(), config, None)
             .expect("worker should build");
         worker
             .queue

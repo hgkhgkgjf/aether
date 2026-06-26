@@ -1,6 +1,7 @@
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -9,9 +10,10 @@ use aether_data_contracts::DataLayerError;
 use aether_runtime_state::RuntimeQueueStore;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::executor::spawn_on_usage_background_runtime;
+use crate::worker::{UsageWorkerControl, UsageWorkerObservation};
 use crate::{
     apply_usage_body_capture_policy_to_event, build_stream_terminal_usage_seed,
     build_sync_terminal_usage_seed, build_terminal_usage_event_from_seed,
@@ -80,8 +82,15 @@ pub struct UsageRuntime {
     config: UsageRuntimeConfig,
     body_policy_cache: Arc<tokio::sync::Mutex<Option<UsageBodyCapturePolicyCacheEntry>>>,
     enqueue_retry: Arc<UsageEnqueueRetryDispatcher>,
+    worker_supervisor_state: Arc<UsageWorkerSupervisorState>,
     terminal_enqueue_state: Arc<LifecycleEnqueueState>,
     lifecycle_enqueue_state: Arc<LifecycleEnqueueState>,
+}
+
+#[derive(Debug, Default)]
+struct UsageWorkerSupervisorState {
+    active_count: AtomicUsize,
+    desired_count: AtomicUsize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -89,6 +98,11 @@ pub struct UsageRuntimeMetricsSnapshot {
     pub enabled: bool,
     pub queue_terminal_events: bool,
     pub queue_lifecycle_events: bool,
+    pub worker_count: usize,
+    pub worker_autoscale_enabled: bool,
+    pub worker_max_count: usize,
+    pub worker_active_count: usize,
+    pub worker_desired_count: usize,
     pub retry_deferred_lifecycle_events: bool,
     pub terminal_enqueue_in_flight: u64,
     pub terminal_enqueue_deferred_total: u64,
@@ -118,6 +132,7 @@ impl UsageRuntime {
             config: UsageRuntimeConfig::disabled(),
             body_policy_cache: Arc::new(tokio::sync::Mutex::new(None)),
             enqueue_retry: UsageEnqueueRetryDispatcher::disabled(),
+            worker_supervisor_state: Arc::new(UsageWorkerSupervisorState::default()),
             terminal_enqueue_state: Arc::new(LifecycleEnqueueState::default()),
             lifecycle_enqueue_state: Arc::new(LifecycleEnqueueState::default()),
         }
@@ -130,6 +145,7 @@ impl UsageRuntime {
             config,
             body_policy_cache: Arc::new(tokio::sync::Mutex::new(None)),
             enqueue_retry,
+            worker_supervisor_state: Arc::new(UsageWorkerSupervisorState::default()),
             terminal_enqueue_state: Arc::new(LifecycleEnqueueState::default()),
             lifecycle_enqueue_state: Arc::new(LifecycleEnqueueState::default()),
         })
@@ -144,6 +160,17 @@ impl UsageRuntime {
             enabled: self.config.enabled,
             queue_terminal_events: self.config.queue_terminal_events,
             queue_lifecycle_events: self.config.queue_lifecycle_events,
+            worker_count: self.config.worker_count,
+            worker_autoscale_enabled: self.config.worker_autoscale_enabled,
+            worker_max_count: self.config.worker_max_count,
+            worker_active_count: self
+                .worker_supervisor_state
+                .active_count
+                .load(Ordering::Acquire),
+            worker_desired_count: self
+                .worker_supervisor_state
+                .desired_count
+                .load(Ordering::Acquire),
             retry_deferred_lifecycle_events: self.config.retry_deferred_lifecycle_events,
             terminal_enqueue_in_flight: self.terminal_enqueue_state.in_flight(),
             terminal_enqueue_deferred_total: self.terminal_enqueue_state.deferred_total(),
@@ -182,8 +209,59 @@ impl UsageRuntime {
             return None;
         }
         let runner = data.usage_worker_queue()?;
-        let worker = build_usage_queue_worker(runner, data, self.config.clone()).ok()?;
+        let worker = build_usage_queue_worker(runner, data, self.config.clone(), None).ok()?;
         Some(worker.spawn())
+    }
+
+    pub fn spawn_workers<T>(&self, data: Arc<T>) -> Vec<tokio::task::JoinHandle<()>>
+    where
+        T: UsageRuntimeAccess + 'static,
+    {
+        if !self.can_spawn_worker(data.as_ref()) {
+            return Vec::new();
+        }
+        let Some(runner) = data.usage_worker_queue() else {
+            return Vec::new();
+        };
+
+        let worker_count = self.config.worker_count.max(1);
+        let mut handles = Vec::with_capacity(worker_count);
+        for worker_index in 0..worker_count {
+            let Ok(worker) = build_usage_queue_worker(
+                Arc::clone(&runner),
+                Arc::clone(&data),
+                self.config.clone(),
+                Some(worker_index),
+            ) else {
+                warn!(
+                    event_name = "usage_worker_build_failed",
+                    log_type = "ops",
+                    worker_index,
+                    "usage runtime failed to build usage queue worker"
+                );
+                continue;
+            };
+            handles.push(worker.spawn());
+        }
+        handles
+    }
+
+    pub fn spawn_worker_supervisor<T>(&self, data: Arc<T>) -> Option<tokio::task::JoinHandle<()>>
+    where
+        T: UsageRuntimeAccess + 'static,
+    {
+        if !self.can_spawn_worker(data.as_ref()) {
+            return None;
+        }
+        let runner = data.usage_worker_queue()?;
+        Some(spawn_on_usage_background_runtime(
+            run_usage_worker_supervisor(
+                runner,
+                data,
+                self.config.clone(),
+                Arc::clone(&self.worker_supervisor_state),
+            ),
+        ))
     }
 
     pub fn record_pending<T>(&self, data: &T, seed: LifecycleUsageSeed)
@@ -785,6 +863,258 @@ where
     }
 }
 
+struct ManagedUsageWorker {
+    control: UsageWorkerControl,
+    stopping: bool,
+}
+
+async fn run_usage_worker_supervisor<T>(
+    runner: Arc<dyn RuntimeQueueStore>,
+    data: Arc<T>,
+    config: UsageRuntimeConfig,
+    state: Arc<UsageWorkerSupervisorState>,
+) where
+    T: UsageRuntimeAccess + 'static,
+{
+    let min_workers = config.worker_count.max(1);
+    let max_workers = if config.worker_autoscale_enabled {
+        config.worker_max_count.max(min_workers)
+    } else {
+        min_workers
+    };
+    let mut desired_workers = min_workers;
+    let mut next_worker_index = 0usize;
+    let mut workers = BTreeMap::<usize, ManagedUsageWorker>::new();
+    let mut worker_task_indexes = BTreeMap::<tokio::task::Id, usize>::new();
+    let mut join_set = tokio::task::JoinSet::<usize>::new();
+    let (telemetry_tx, mut telemetry_rx) =
+        mpsc::channel::<UsageWorkerObservation>(max_workers.saturating_mul(4).clamp(16, 1024));
+    let mut scale_interval = tokio::time::interval(Duration::from_millis(
+        config.worker_scale_interval_ms.max(1),
+    ));
+    scale_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut full_reads = 0usize;
+    let mut busy_reads = 0usize;
+    let mut idle_reads = 0usize;
+    let mut idle_ticks = 0u64;
+
+    state
+        .desired_count
+        .store(desired_workers, Ordering::Release);
+    reconcile_usage_workers(
+        &runner,
+        &data,
+        &config,
+        &telemetry_tx,
+        &mut join_set,
+        &mut worker_task_indexes,
+        &mut workers,
+        &mut next_worker_index,
+        desired_workers,
+    );
+    state.active_count.store(workers.len(), Ordering::Release);
+
+    loop {
+        tokio::select! {
+            Some(observation) = telemetry_rx.recv() => {
+                if observation.entries_read == 0 {
+                    idle_reads = idle_reads.saturating_add(1);
+                } else {
+                    busy_reads = busy_reads.saturating_add(1);
+                    if observation.entries_read >= observation.batch_size {
+                        full_reads = full_reads.saturating_add(1);
+                    }
+                }
+            }
+            _ = scale_interval.tick() => {
+                drain_finished_usage_workers(
+                    &mut join_set,
+                    &mut worker_task_indexes,
+                    &mut workers,
+                );
+                if config.worker_autoscale_enabled {
+                    let active_workers = workers.len().max(1);
+                    let high_pressure = full_reads > 0
+                        || (busy_reads >= active_workers.saturating_mul(2) && idle_reads == 0);
+                    if high_pressure && desired_workers < max_workers {
+                        let grow_by = (active_workers + 1) / 2;
+                        let next = desired_workers
+                            .saturating_add(grow_by.max(1))
+                            .clamp(min_workers, max_workers);
+                        if next > desired_workers {
+                            info!(
+                                event_name = "usage_worker_autoscale_up",
+                                log_type = "ops",
+                                desired_workers = next,
+                                previous_desired_workers = desired_workers,
+                                active_workers = workers.len(),
+                                max_workers,
+                                full_reads,
+                                busy_reads,
+                                idle_reads,
+                                "usage worker supervisor scaled up"
+                            );
+                            desired_workers = next;
+                            idle_ticks = 0;
+                        }
+                    } else if desired_workers > min_workers
+                        && busy_reads == 0
+                        && full_reads == 0
+                        && idle_reads >= active_workers
+                    {
+                        idle_ticks = idle_ticks.saturating_add(1);
+                        if idle_ticks >= config.worker_idle_scale_down_ticks {
+                            let next = desired_workers
+                                .saturating_sub((desired_workers + 1) / 2)
+                                .max(min_workers);
+                            if next < desired_workers {
+                                info!(
+                                    event_name = "usage_worker_autoscale_down",
+                                    log_type = "ops",
+                                    desired_workers = next,
+                                    previous_desired_workers = desired_workers,
+                                    active_workers = workers.len(),
+                                    min_workers,
+                                    idle_ticks,
+                                    "usage worker supervisor scaled down"
+                                );
+                                desired_workers = next;
+                            }
+                            idle_ticks = 0;
+                        }
+                    } else if busy_reads > 0 || full_reads > 0 {
+                        idle_ticks = 0;
+                    }
+                }
+
+                state.desired_count.store(desired_workers, Ordering::Release);
+                reconcile_usage_workers(
+                    &runner,
+                    &data,
+                    &config,
+                    &telemetry_tx,
+                    &mut join_set,
+                    &mut worker_task_indexes,
+                    &mut workers,
+                    &mut next_worker_index,
+                    desired_workers,
+                );
+                state
+                    .active_count
+                    .store(workers.len(), Ordering::Release);
+                full_reads = 0;
+                busy_reads = 0;
+                idle_reads = 0;
+            }
+        }
+    }
+}
+
+fn reconcile_usage_workers<T>(
+    runner: &Arc<dyn RuntimeQueueStore>,
+    data: &Arc<T>,
+    config: &UsageRuntimeConfig,
+    telemetry_tx: &mpsc::Sender<UsageWorkerObservation>,
+    join_set: &mut tokio::task::JoinSet<usize>,
+    worker_task_indexes: &mut BTreeMap<tokio::task::Id, usize>,
+    workers: &mut BTreeMap<usize, ManagedUsageWorker>,
+    next_worker_index: &mut usize,
+    desired_workers: usize,
+) where
+    T: UsageRuntimeAccess + 'static,
+{
+    while workers.len() < desired_workers {
+        let worker_index = *next_worker_index;
+        *next_worker_index = (*next_worker_index).saturating_add(1);
+        let control = UsageWorkerControl::default();
+        let Ok(worker) = build_usage_queue_worker(
+            Arc::clone(runner),
+            Arc::clone(data),
+            config.clone(),
+            Some(worker_index),
+        ) else {
+            warn!(
+                event_name = "usage_worker_build_failed",
+                log_type = "ops",
+                worker_index,
+                "usage runtime failed to build elastic usage queue worker"
+            );
+            break;
+        };
+        let worker = worker.with_supervisor(control.clone(), telemetry_tx.clone());
+        let handle = join_set.spawn(async move {
+            worker.run().await;
+            worker_index
+        });
+        worker_task_indexes.insert(handle.id(), worker_index);
+        workers.insert(
+            worker_index,
+            ManagedUsageWorker {
+                control,
+                stopping: false,
+            },
+        );
+    }
+
+    let mut excess = workers.len().saturating_sub(desired_workers);
+    for worker in workers.values_mut().rev() {
+        if excess == 0 {
+            break;
+        }
+        if worker.stopping {
+            continue;
+        }
+        worker.control.request_shutdown();
+        worker.stopping = true;
+        excess -= 1;
+    }
+}
+
+fn drain_finished_usage_workers(
+    join_set: &mut tokio::task::JoinSet<usize>,
+    worker_task_indexes: &mut BTreeMap<tokio::task::Id, usize>,
+    workers: &mut BTreeMap<usize, ManagedUsageWorker>,
+) {
+    while let Some(result) = join_set.try_join_next_with_id() {
+        match result {
+            Ok((task_id, worker_index)) => {
+                worker_task_indexes.remove(&task_id);
+                let stopping = workers
+                    .remove(&worker_index)
+                    .is_some_and(|worker| worker.stopping);
+                if !stopping {
+                    warn!(
+                        event_name = "usage_worker_unexpected_exit",
+                        log_type = "ops",
+                        worker_index,
+                        "usage worker exited before supervisor requested shutdown"
+                    );
+                }
+            }
+            Err(err) => {
+                let worker_index = worker_task_indexes.remove(&err.id());
+                if let Some(worker_index) = worker_index {
+                    workers.remove(&worker_index);
+                    warn!(
+                        event_name = "usage_worker_join_failed",
+                        log_type = "ops",
+                        worker_index,
+                        error = %err,
+                        "usage worker task failed"
+                    );
+                    continue;
+                }
+                warn!(
+                    event_name = "usage_worker_join_failed",
+                    log_type = "ops",
+                    error = %err,
+                    "usage worker task failed"
+                );
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct UsageBodyCapturePolicyCacheEntry {
     cached_at: Instant,
@@ -1301,6 +1631,11 @@ mod tests {
         queue: Arc<dyn RuntimeQueueStore>,
     }
 
+    struct PanicOnceQueueConfiguredUsageStore {
+        inner: CloneQueueConfiguredUsageStore,
+        remaining_panics: AtomicUsize,
+    }
+
     struct EnrichmentCountingQueueStore {
         records: Mutex<Vec<UpsertUsageRecord>>,
         queue: Arc<dyn RuntimeQueueStore>,
@@ -1492,6 +1827,73 @@ mod tests {
 
         fn usage_worker_queue(&self) -> Option<Arc<dyn RuntimeQueueStore>> {
             Some(Arc::clone(&self.queue))
+        }
+    }
+
+    #[async_trait]
+    impl UsageRecordWriter for PanicOnceQueueConfiguredUsageStore {
+        async fn upsert_usage_record(
+            &self,
+            record: UpsertUsageRecord,
+        ) -> Result<Option<StoredRequestUsageAudit>, DataLayerError> {
+            let should_panic = self
+                .remaining_panics
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    (current > 0).then(|| current - 1)
+                })
+                .is_ok();
+            if should_panic {
+                panic!("forced usage writer panic");
+            }
+            self.inner.upsert_usage_record(record).await
+        }
+    }
+
+    #[async_trait]
+    impl UsageSettlementWriter for PanicOnceQueueConfiguredUsageStore {
+        fn has_usage_settlement_writer(&self) -> bool {
+            false
+        }
+
+        async fn settle_usage(
+            &self,
+            _input: UsageSettlementInput,
+        ) -> Result<Option<StoredUsageSettlement>, DataLayerError> {
+            Ok(None)
+        }
+    }
+
+    #[async_trait]
+    impl UsageBillingEventEnricher for PanicOnceQueueConfiguredUsageStore {
+        async fn enrich_usage_event(&self, _event: &mut UsageEvent) -> Result<(), DataLayerError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ManualProxyNodeCounter for PanicOnceQueueConfiguredUsageStore {
+        async fn increment_manual_proxy_node_requests(
+            &self,
+            _node_id: &str,
+            _total_delta: i64,
+            _failed_delta: i64,
+            _latency_ms: Option<i64>,
+        ) -> Result<(), DataLayerError> {
+            Ok(())
+        }
+    }
+
+    impl UsageRuntimeAccess for PanicOnceQueueConfiguredUsageStore {
+        fn has_usage_writer(&self) -> bool {
+            true
+        }
+
+        fn has_usage_worker_queue(&self) -> bool {
+            true
+        }
+
+        fn usage_worker_queue(&self) -> Option<Arc<dyn RuntimeQueueStore>> {
+            Some(Arc::clone(&self.inner.queue))
         }
     }
 
@@ -1829,6 +2231,198 @@ mod tests {
         }
 
         panic!("pending lifecycle usage event was not enqueued");
+    }
+
+    #[test]
+    fn spawn_workers_uses_configured_worker_count() {
+        let config = UsageRuntimeConfig {
+            enabled: true,
+            queue_terminal_events: true,
+            worker_count: 3,
+            stream_key: "usage:events:test:worker-count".to_string(),
+            consumer_group: "usage_consumers_test_worker_count".to_string(),
+            ..UsageRuntimeConfig::default()
+        };
+        let runtime = UsageRuntime::new(config).expect("usage runtime should build");
+        let store = CloneQueueConfiguredUsageStore {
+            records: Arc::new(Mutex::new(Vec::new())),
+            queue: Arc::new(RuntimeState::memory(MemoryRuntimeStateConfig::default())),
+        };
+
+        let handles = runtime.spawn_workers(Arc::new(store));
+        assert_eq!(handles.len(), 3);
+        for handle in handles {
+            handle.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_supervisor_scales_up_when_reads_stay_full() {
+        let config = UsageRuntimeConfig {
+            enabled: true,
+            queue_terminal_events: true,
+            worker_count: 1,
+            worker_autoscale_enabled: true,
+            worker_max_count: 4,
+            worker_scale_interval_ms: 10,
+            worker_idle_scale_down_ticks: 100,
+            stream_key: "usage:events:test:worker-autoscale-up".to_string(),
+            consumer_group: "usage_consumers_test_worker_autoscale_up".to_string(),
+            consumer_batch_size: 1,
+            consumer_block_ms: 1,
+            ..UsageRuntimeConfig::default()
+        };
+        let queue_runner: Arc<dyn RuntimeQueueStore> =
+            Arc::new(RuntimeState::memory(MemoryRuntimeStateConfig::default()));
+        let queue = UsageQueue::new(Arc::clone(&queue_runner), config.clone())
+            .expect("usage queue should build");
+        queue
+            .ensure_consumer_group()
+            .await
+            .expect("consumer group should initialize");
+        for index in 0..32 {
+            queue
+                .enqueue(&UsageEvent::new(
+                    UsageEventType::Completed,
+                    format!("req-worker-autoscale-up-{index}"),
+                    UsageEventData {
+                        provider_name: "openai".to_string(),
+                        model: "gpt-5".to_string(),
+                        total_tokens: Some(12),
+                        status_code: Some(200),
+                        ..UsageEventData::default()
+                    },
+                ))
+                .await
+                .expect("usage event should enqueue");
+        }
+        let store = CloneQueueConfiguredUsageStore {
+            records: Arc::new(Mutex::new(Vec::new())),
+            queue: queue_runner,
+        };
+        let runtime = UsageRuntime::new(config).expect("usage runtime should build");
+
+        let supervisor = runtime
+            .spawn_worker_supervisor(Arc::new(store))
+            .expect("supervisor should spawn");
+        for _ in 0..100 {
+            let snapshot = runtime.metrics_snapshot();
+            if snapshot.worker_desired_count > 1 {
+                supervisor.abort();
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        supervisor.abort();
+
+        let snapshot = runtime.metrics_snapshot();
+        assert!(
+            snapshot.worker_desired_count > 1,
+            "usage worker supervisor should scale up after repeated full reads: {snapshot:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_supervisor_replaces_worker_after_panic() {
+        let config = UsageRuntimeConfig {
+            enabled: true,
+            queue_terminal_events: true,
+            worker_count: 1,
+            worker_autoscale_enabled: false,
+            worker_max_count: 1,
+            worker_scale_interval_ms: 10,
+            stream_key: "usage:events:test:worker-panic-recovery".to_string(),
+            consumer_group: "usage_consumers_test_worker_panic_recovery".to_string(),
+            consumer_batch_size: 1,
+            consumer_block_ms: 1,
+            reclaim_idle_ms: 60_000,
+            reclaim_interval_ms: 60_000,
+            ..UsageRuntimeConfig::default()
+        };
+        let queue_runner: Arc<dyn RuntimeQueueStore> =
+            Arc::new(RuntimeState::memory(MemoryRuntimeStateConfig::default()));
+        let queue = UsageQueue::new(Arc::clone(&queue_runner), config.clone())
+            .expect("usage queue should build");
+        queue
+            .ensure_consumer_group()
+            .await
+            .expect("consumer group should initialize");
+        queue
+            .enqueue(&UsageEvent::new(
+                UsageEventType::Completed,
+                "req-worker-panic-first",
+                UsageEventData {
+                    provider_name: "openai".to_string(),
+                    model: "gpt-5".to_string(),
+                    total_tokens: Some(12),
+                    status_code: Some(200),
+                    ..UsageEventData::default()
+                },
+            ))
+            .await
+            .expect("first usage event should enqueue");
+
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let store = Arc::new(PanicOnceQueueConfiguredUsageStore {
+            inner: CloneQueueConfiguredUsageStore {
+                records: Arc::clone(&records),
+                queue: queue_runner,
+            },
+            remaining_panics: AtomicUsize::new(1),
+        });
+        let runtime = UsageRuntime::new(config).expect("usage runtime should build");
+        let supervisor = runtime
+            .spawn_worker_supervisor(Arc::clone(&store))
+            .expect("supervisor should spawn");
+
+        for _ in 0..100 {
+            if store.remaining_panics.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            store.remaining_panics.load(Ordering::Acquire),
+            0,
+            "first worker should panic while processing the first event"
+        );
+
+        queue
+            .enqueue(&UsageEvent::new(
+                UsageEventType::Completed,
+                "req-worker-panic-second",
+                UsageEventData {
+                    provider_name: "openai".to_string(),
+                    model: "gpt-5".to_string(),
+                    total_tokens: Some(24),
+                    status_code: Some(200),
+                    ..UsageEventData::default()
+                },
+            ))
+            .await
+            .expect("second usage event should enqueue");
+
+        for _ in 0..100 {
+            let recorded_second = records
+                .lock()
+                .expect("records lock")
+                .iter()
+                .any(|record| record.request_id == "req-worker-panic-second");
+            if recorded_second {
+                supervisor.abort();
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        supervisor.abort();
+
+        let records = records.lock().expect("records lock");
+        assert!(
+            records
+                .iter()
+                .any(|record| record.request_id == "req-worker-panic-second"),
+            "replacement worker should consume events after the first worker panics: {records:?}"
+        );
     }
 
     #[tokio::test]

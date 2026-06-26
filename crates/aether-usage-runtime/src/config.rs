@@ -5,6 +5,11 @@ pub struct UsageRuntimeConfig {
     pub enabled: bool,
     pub queue_terminal_events: bool,
     pub queue_lifecycle_events: bool,
+    pub worker_count: usize,
+    pub worker_autoscale_enabled: bool,
+    pub worker_max_count: usize,
+    pub worker_scale_interval_ms: u64,
+    pub worker_idle_scale_down_ticks: u64,
     pub stream_key: String,
     pub consumer_group: String,
     pub dlq_stream_key: String,
@@ -29,6 +34,11 @@ impl Default for UsageRuntimeConfig {
             enabled: false,
             queue_terminal_events: false,
             queue_lifecycle_events: false,
+            worker_count: 4,
+            worker_autoscale_enabled: true,
+            worker_max_count: 64,
+            worker_scale_interval_ms: 1_000,
+            worker_idle_scale_down_ticks: 30,
             stream_key: "usage:events".to_string(),
             consumer_group: "usage_consumers".to_string(),
             dlq_stream_key: "usage:events:dlq".to_string(),
@@ -72,6 +82,26 @@ impl UsageRuntimeConfig {
         if self.dlq_stream_key.trim().is_empty() {
             return Err(DataLayerError::InvalidConfiguration(
                 "usage runtime dlq_stream_key cannot be empty".to_string(),
+            ));
+        }
+        if self.worker_count == 0 {
+            return Err(DataLayerError::InvalidConfiguration(
+                "usage runtime worker_count must be positive".to_string(),
+            ));
+        }
+        if self.worker_max_count == 0 {
+            return Err(DataLayerError::InvalidConfiguration(
+                "usage runtime worker_max_count must be positive".to_string(),
+            ));
+        }
+        if self.worker_scale_interval_ms == 0 {
+            return Err(DataLayerError::InvalidConfiguration(
+                "usage runtime worker_scale_interval_ms must be positive".to_string(),
+            ));
+        }
+        if self.worker_idle_scale_down_ticks == 0 {
+            return Err(DataLayerError::InvalidConfiguration(
+                "usage runtime worker_idle_scale_down_ticks must be positive".to_string(),
             ));
         }
         if self.stream_maxlen == 0 {

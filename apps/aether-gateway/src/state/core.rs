@@ -1357,6 +1357,15 @@ impl AppState {
                 definition.trigger,
             ));
         };
+
+        if let Some(handle) = self
+            .usage_runtime
+            .spawn_worker_supervisor(self.data.clone())
+        {
+            supervisor.supervise_handle(crate::task_runtime::TASK_KEY_USAGE_QUEUE_WORKER, handle);
+            record_boot(crate::task_runtime::TASK_KEY_USAGE_QUEUE_WORKER);
+        }
+
         let mut supervise_worker =
             |task_key: &'static str, handle: Option<tokio::task::JoinHandle<()>>| {
                 if let Some(handle) = handle {
@@ -1365,10 +1374,6 @@ impl AppState {
                 }
             };
 
-        supervise_worker(
-            crate::task_runtime::TASK_KEY_USAGE_QUEUE_WORKER,
-            self.usage_runtime.spawn_worker(self.data.clone()),
-        );
         supervise_worker(
             crate::task_runtime::TASK_KEY_USAGE_COUNTER_FLUSH,
             spawn_usage_counter_flush_worker(self.data.clone()),
@@ -1550,6 +1555,36 @@ fn usage_runtime_metric_samples(
             "Whether lifecycle usage events are queued.",
             MetricKind::Gauge,
             u64::from(snapshot.queue_lifecycle_events),
+        ),
+        MetricSample::new(
+            "usage_runtime_queue_worker_count",
+            "Minimum configured number of usage queue worker consumers.",
+            MetricKind::Gauge,
+            snapshot.worker_count as u64,
+        ),
+        MetricSample::new(
+            "usage_runtime_queue_worker_autoscale_enabled",
+            "Whether usage queue worker autoscaling is enabled.",
+            MetricKind::Gauge,
+            u64::from(snapshot.worker_autoscale_enabled),
+        ),
+        MetricSample::new(
+            "usage_runtime_queue_worker_max_count",
+            "Maximum configured number of elastic usage queue worker consumers.",
+            MetricKind::Gauge,
+            snapshot.worker_max_count as u64,
+        ),
+        MetricSample::new(
+            "usage_runtime_queue_worker_active_count",
+            "Current active usage queue worker consumers managed by the supervisor.",
+            MetricKind::Gauge,
+            snapshot.worker_active_count as u64,
+        ),
+        MetricSample::new(
+            "usage_runtime_queue_worker_desired_count",
+            "Current desired usage queue worker consumers selected by autoscaling.",
+            MetricKind::Gauge,
+            snapshot.worker_desired_count as u64,
         ),
         MetricSample::new(
             "usage_runtime_retry_deferred_lifecycle_events_enabled",

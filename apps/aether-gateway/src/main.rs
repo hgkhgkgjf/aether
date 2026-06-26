@@ -245,6 +245,12 @@ const AUTO_SERVER_SQL_POOL_MIN_CONNECTIONS_FLOOR: u32 = 4;
 const AUTO_SERVER_SQL_POOL_MIN_CONNECTIONS_CAP: u32 = 16;
 const AUTO_SERVER_SQL_POOL_MAX_CONNECTIONS_FLOOR: u32 = 20;
 const AUTO_SERVER_SQL_POOL_MAX_CONNECTIONS_CAP: u32 = 100;
+const DEFAULT_USAGE_QUEUE_WORKERS_CAP: usize = 8;
+const AUTO_USAGE_QUEUE_WORKERS_MIN: usize = 2;
+const AUTO_USAGE_QUEUE_WORKERS_REQUESTS_PER_WORKER: usize = 128;
+const AUTO_USAGE_QUEUE_WORKERS_DB_SHARE_ALL: usize = 4;
+const AUTO_USAGE_QUEUE_WORKERS_DB_SHARE_BACKGROUND: usize = 2;
+const MAX_USAGE_QUEUE_WORKERS: usize = 64;
 const DEFAULT_GATEWAY_LISTEN_BACKLOG: i32 = 65_535;
 const MIN_GATEWAY_LISTEN_BACKLOG: i32 = 128;
 const MAX_GATEWAY_LISTEN_BACKLOG: i32 = 65_535;
@@ -261,10 +267,97 @@ fn env_var_trimmed(name: &str) -> Option<String> {
 }
 
 fn available_parallelism_u32() -> u32 {
-    std::thread::available_parallelism()
-        .map(|value| u32::try_from(value.get()).unwrap_or(u32::MAX))
-        .unwrap_or(AUTO_SERVER_SQL_POOL_MIN_CONNECTIONS_FLOOR)
+    u32::try_from(available_parallelism_usize())
+        .unwrap_or(u32::MAX)
         .max(1)
+}
+
+fn available_parallelism_usize() -> usize {
+    std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(AUTO_SERVER_SQL_POOL_MIN_CONNECTIONS_FLOOR as usize)
+        .max(1)
+}
+
+fn usage_queue_request_concurrency_hint(
+    max_in_flight_requests: Option<usize>,
+    distributed_request_limit: Option<usize>,
+) -> Option<usize> {
+    match (
+        max_in_flight_requests.filter(|limit| *limit > 0),
+        distributed_request_limit.filter(|limit| *limit > 0),
+    ) {
+        (Some(local), Some(distributed)) => Some(local.min(distributed)),
+        (Some(local), None) => Some(local),
+        (None, Some(distributed)) => Some(distributed),
+        (None, None) => None,
+    }
+}
+
+fn usage_queue_workers_for_request_concurrency(request_concurrency: usize) -> usize {
+    let workers = request_concurrency
+        .saturating_add(AUTO_USAGE_QUEUE_WORKERS_REQUESTS_PER_WORKER - 1)
+        / AUTO_USAGE_QUEUE_WORKERS_REQUESTS_PER_WORKER;
+    workers.clamp(AUTO_USAGE_QUEUE_WORKERS_MIN, MAX_USAGE_QUEUE_WORKERS)
+}
+
+fn usage_queue_worker_database_cap(
+    node_role: NodeRoleArg,
+    database: Option<&SqlDatabaseConfig>,
+) -> usize {
+    let Some(database) = database else {
+        return MAX_USAGE_QUEUE_WORKERS;
+    };
+    if database.driver == DatabaseDriver::Sqlite {
+        return 1;
+    }
+
+    let divisor = if matches!(node_role, NodeRoleArg::Background) {
+        AUTO_USAGE_QUEUE_WORKERS_DB_SHARE_BACKGROUND
+    } else {
+        AUTO_USAGE_QUEUE_WORKERS_DB_SHARE_ALL
+    };
+    let max_connections = database.pool.max_connections.max(1) as usize;
+    max_connections
+        .saturating_add(divisor - 1)
+        .checked_div(divisor)
+        .unwrap_or(1)
+        .clamp(1, MAX_USAGE_QUEUE_WORKERS)
+}
+
+fn automatic_usage_queue_workers_for_parallelism(
+    parallelism: usize,
+    node_role: NodeRoleArg,
+    max_in_flight_requests: Option<usize>,
+    distributed_request_limit: Option<usize>,
+    database: Option<&SqlDatabaseConfig>,
+) -> usize {
+    let cpu_default = parallelism.max(1).clamp(
+        AUTO_USAGE_QUEUE_WORKERS_MIN,
+        DEFAULT_USAGE_QUEUE_WORKERS_CAP,
+    );
+    let requested =
+        usage_queue_request_concurrency_hint(max_in_flight_requests, distributed_request_limit)
+            .map(usage_queue_workers_for_request_concurrency)
+            .unwrap_or(cpu_default);
+    requested
+        .min(usage_queue_worker_database_cap(node_role, database))
+        .clamp(1, MAX_USAGE_QUEUE_WORKERS)
+}
+
+fn automatic_usage_queue_workers(
+    node_role: NodeRoleArg,
+    max_in_flight_requests: Option<usize>,
+    distributed_request_limit: Option<usize>,
+    database: Option<&SqlDatabaseConfig>,
+) -> usize {
+    automatic_usage_queue_workers_for_parallelism(
+        available_parallelism_usize(),
+        node_role,
+        max_in_flight_requests,
+        distributed_request_limit,
+        database,
+    )
 }
 
 fn automatic_sql_pool_config(driver: DatabaseDriver) -> SqlPoolConfig {
@@ -525,6 +618,37 @@ struct GatewayUsageArgs {
     )]
     queue_lifecycle_events: bool,
 
+    #[arg(long, env = "AETHER_GATEWAY_USAGE_QUEUE_WORKERS", value_name = "COUNT")]
+    queue_workers: Option<usize>,
+
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_USAGE_QUEUE_WORKER_AUTOSCALE_ENABLED",
+        default_value_t = true
+    )]
+    queue_worker_autoscale_enabled: bool,
+
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_USAGE_QUEUE_WORKER_MAX_COUNT",
+        value_name = "COUNT"
+    )]
+    queue_worker_max_count: Option<usize>,
+
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_USAGE_QUEUE_WORKER_SCALE_INTERVAL_MS",
+        default_value_t = 1_000
+    )]
+    queue_worker_scale_interval_ms: u64,
+
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_USAGE_QUEUE_WORKER_IDLE_SCALE_DOWN_TICKS",
+        default_value_t = 30
+    )]
+    queue_worker_idle_scale_down_ticks: u64,
+
     #[arg(
         long,
         env = "AETHER_GATEWAY_USAGE_QUEUE_STREAM_KEY",
@@ -639,11 +763,66 @@ struct GatewayUsageArgs {
 }
 
 impl GatewayUsageArgs {
-    fn to_config(&self) -> UsageRuntimeConfig {
+    fn effective_queue_workers(
+        &self,
+        node_role: NodeRoleArg,
+        max_in_flight_requests: Option<usize>,
+        distributed_request_limit: Option<usize>,
+        database: Option<&SqlDatabaseConfig>,
+    ) -> usize {
+        if let Some(queue_workers) = self.queue_workers {
+            return queue_workers.clamp(1, MAX_USAGE_QUEUE_WORKERS);
+        }
+        if !self.queue_terminal_events && !self.queue_lifecycle_events {
+            return 1;
+        }
+        automatic_usage_queue_workers(
+            node_role,
+            max_in_flight_requests,
+            distributed_request_limit,
+            database,
+        )
+    }
+
+    fn effective_queue_worker_max_count(
+        &self,
+        node_role: NodeRoleArg,
+        database: Option<&SqlDatabaseConfig>,
+        worker_count: usize,
+    ) -> usize {
+        if !self.queue_worker_autoscale_enabled {
+            return worker_count.max(1).min(MAX_USAGE_QUEUE_WORKERS);
+        }
+        self.queue_worker_max_count
+            .unwrap_or_else(|| usage_queue_worker_database_cap(node_role, database))
+            .clamp(worker_count.max(1), MAX_USAGE_QUEUE_WORKERS)
+    }
+
+    fn runtime_state_blocking_stream_lanes(
+        &self,
+        node_role: NodeRoleArg,
+        database: Option<&SqlDatabaseConfig>,
+        worker_max_count: usize,
+    ) -> Option<usize> {
+        if !node_role.spawns_background_tasks()
+            || (!self.queue_terminal_events && !self.queue_lifecycle_events)
+            || database.is_none()
+        {
+            return None;
+        }
+        Some(worker_max_count.clamp(1, MAX_USAGE_QUEUE_WORKERS))
+    }
+
+    fn to_config(&self, worker_count: usize, worker_max_count: usize) -> UsageRuntimeConfig {
         UsageRuntimeConfig {
             enabled: true,
             queue_terminal_events: self.queue_terminal_events,
             queue_lifecycle_events: self.queue_lifecycle_events,
+            worker_count: worker_count.clamp(1, MAX_USAGE_QUEUE_WORKERS),
+            worker_autoscale_enabled: self.queue_worker_autoscale_enabled,
+            worker_max_count: worker_max_count.clamp(worker_count.max(1), MAX_USAGE_QUEUE_WORKERS),
+            worker_scale_interval_ms: self.queue_worker_scale_interval_ms.max(1),
+            worker_idle_scale_down_ticks: self.queue_worker_idle_scale_down_ticks.max(1),
             stream_key: self.queue_stream_key.trim().to_string(),
             consumer_group: self.queue_group.trim().to_string(),
             dlq_stream_key: self.queue_dlq_stream_key.trim().to_string(),
@@ -1041,6 +1220,7 @@ impl Args {
         &self,
         runtime_backend: RuntimeBackendArg,
         data_redis_url: Option<&str>,
+        blocking_stream_lanes: Option<usize>,
     ) -> RuntimeStateConfig {
         let redis = self
             .effective_runtime_redis_url(data_redis_url)
@@ -1052,6 +1232,7 @@ impl Args {
             backend: runtime_backend.to_runtime_state_backend(),
             redis,
             command_timeout_ms: Some(self.runtime_command_timeout_ms.max(1)),
+            blocking_stream_lanes,
             ..RuntimeStateConfig::default()
         }
     }
@@ -1397,10 +1578,35 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         runtime_redis_url.as_deref(),
         runtime_backend,
     )?;
+    let usage_queue_request_concurrency_hint = usage_queue_request_concurrency_hint(
+        args.max_in_flight_requests,
+        args.distributed_request_limit,
+    );
+    let usage_queue_workers = args.usage.effective_queue_workers(
+        args.node_role,
+        args.max_in_flight_requests,
+        args.distributed_request_limit,
+        sql_database_config.as_ref(),
+    );
+    let usage_queue_worker_max_count = args.usage.effective_queue_worker_max_count(
+        args.node_role,
+        sql_database_config.as_ref(),
+        usage_queue_workers,
+    );
+    let usage_config = args
+        .usage
+        .to_config(usage_queue_workers, usage_queue_worker_max_count);
+    let usage_blocking_stream_lanes = args.usage.runtime_state_blocking_stream_lanes(
+        args.node_role,
+        sql_database_config.as_ref(),
+        usage_config.worker_max_count,
+    );
     let runtime_state = Arc::new(
-        RuntimeState::from_config(
-            args.runtime_state_config(runtime_backend, data_redis_url.as_deref()),
-        )
+        RuntimeState::from_config(args.runtime_state_config(
+            runtime_backend,
+            data_redis_url.as_deref(),
+            usage_blocking_stream_lanes,
+        ))
         .await
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string()))?,
     );
@@ -1425,6 +1631,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         deployment_topology = args.deployment_topology.as_str(),
         node_role = args.node_role.as_str(),
         runtime_backend = runtime_backend.as_str(),
+        usage_queue_workers = usage_config.worker_count,
+        usage_queue_worker_autoscale_enabled = usage_config.worker_autoscale_enabled,
+        usage_queue_worker_max_count = usage_config.worker_max_count,
+        usage_queue_request_concurrency_hint =
+            usage_queue_request_concurrency_hint.unwrap_or_default(),
+        usage_queue_request_concurrency_hint_source = if usage_queue_request_concurrency_hint.is_some() {
+            "explicit"
+        } else {
+            "none"
+        },
         frontdoor_mode = "compatibility_frontdoor",
         log_format = ?args.logging.log_format,
         log_destination = args.logging.log_destination.as_str(),
@@ -1448,6 +1664,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         video_task_poller_interval_ms = args.video_task_poller_interval_ms,
         video_task_poller_batch_size = args.video_task_poller_batch_size,
         video_task_store_path = args.video_task_store_path.as_deref().unwrap_or("-"),
+        usage_queue_workers = usage_config.worker_count,
+        usage_queue_workers_source = if args.usage.queue_workers.is_some() {
+            "explicit"
+        } else {
+            "auto"
+        },
+        usage_queue_worker_autoscale_enabled = usage_config.worker_autoscale_enabled,
+        usage_queue_worker_max_count = usage_config.worker_max_count,
+        usage_queue_request_concurrency_hint =
+            usage_queue_request_concurrency_hint.unwrap_or_default(),
+        usage_queue_request_concurrency_hint_source =
+            if usage_queue_request_concurrency_hint.is_some() {
+                "explicit"
+            } else {
+                "none"
+            },
         max_in_flight_requests = args.max_in_flight_requests.unwrap_or_default(),
         distributed_request_limit = args.distributed_request_limit.unwrap_or_default(),
         distributed_request_redis_configured = args
@@ -1479,7 +1711,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut state = AppState::new()?
         .with_runtime_state(runtime_state)
         .with_data_config(data_config)?
-        .with_usage_runtime_config(args.usage.to_config())?
+        .with_usage_runtime_config(usage_config)?
         .with_video_task_truth_source_mode(args.video_task_truth_source_mode.into());
     if let Some(cors_config) = args.frontdoor.cors_config() {
         state = state.with_frontdoor_cors_config(cors_config);
@@ -1977,9 +2209,7 @@ fn pending_schema_error(
 ) -> std::io::Error {
     std::io::Error::other(format!(
         "database schema is behind by {} migration(s); next pending migration is {} ({})\nrun `aether-gateway --migrate` before starting the service",
-        pending_count,
-        next_version,
-        next_description
+        pending_count, next_version, next_description
     ))
 }
 
@@ -1990,9 +2220,7 @@ fn pending_backfills_error(
 ) -> std::io::Error {
     std::io::Error::other(format!(
         "database backfills are behind by {} backfill(s); next pending backfill is {} ({})\nrun `aether-gateway --apply-backfills` before starting the service",
-        pending_count,
-        next_version,
-        next_description
+        pending_count, next_version, next_description
     ))
 }
 
@@ -2000,11 +2228,11 @@ fn pending_backfills_error(
 mod tests {
     use super::{
         automatic_sql_pool_config, automatic_sql_pool_config_for_parallelism,
-        ensure_database_backfills_are_current, ensure_database_schema_is_current,
-        pending_backfills_error, pending_schema_error, resolve_healthcheck_url, Args,
-        DatabaseDriverArg, DeploymentTopologyArg, GatewayDataArgs, GatewayFrontdoorArgs,
-        GatewayLogDestinationArg, GatewayLogFormatArg, GatewayLogRotationArg, GatewayLoggingArgs,
-        GatewayRateLimitArgs, GatewayUsageArgs, NodeRoleArg, RuntimeBackendArg,
+        automatic_usage_queue_workers_for_parallelism, ensure_database_backfills_are_current,
+        ensure_database_schema_is_current, pending_backfills_error, pending_schema_error,
+        resolve_healthcheck_url, Args, DatabaseDriverArg, DeploymentTopologyArg, GatewayDataArgs,
+        GatewayFrontdoorArgs, GatewayLogDestinationArg, GatewayLogFormatArg, GatewayLogRotationArg,
+        GatewayLoggingArgs, GatewayRateLimitArgs, GatewayUsageArgs, NodeRoleArg, RuntimeBackendArg,
         VideoTaskTruthSourceArg, DEFAULT_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS,
         DEFAULT_GATEWAY_LISTENER_SHARDS, DEFAULT_GATEWAY_LISTEN_BACKLOG,
         MAX_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS, MAX_GATEWAY_LISTENER_SHARDS,
@@ -2062,6 +2290,11 @@ mod tests {
             usage: GatewayUsageArgs {
                 queue_terminal_events: true,
                 queue_lifecycle_events: true,
+                queue_workers: Some(4),
+                queue_worker_autoscale_enabled: true,
+                queue_worker_max_count: None,
+                queue_worker_scale_interval_ms: 1_000,
+                queue_worker_idle_scale_down_ticks: 30,
                 queue_stream_key: "usage:events".to_string(),
                 queue_group: "usage_consumers".to_string(),
                 queue_dlq_stream_key: "usage:events:dlq".to_string(),
@@ -2098,6 +2331,25 @@ mod tests {
                 log_max_files: 30,
             },
         }
+    }
+
+    fn test_database(driver: DatabaseDriver, max_connections: u32) -> SqlDatabaseConfig {
+        let url = match driver {
+            DatabaseDriver::Sqlite => "sqlite://./data/aether.db",
+            DatabaseDriver::Mysql => "mysql://root:root@localhost/aether",
+            DatabaseDriver::Postgres => "postgres://postgres:postgres@localhost/aether",
+        };
+        let max_connections = max_connections.max(1);
+        SqlDatabaseConfig::new(
+            driver,
+            url,
+            SqlPoolConfig {
+                min_connections: 1,
+                max_connections,
+                ..SqlPoolConfig::default()
+            },
+        )
+        .expect("test database config should build")
     }
 
     #[test]
@@ -2261,6 +2513,183 @@ mod tests {
     }
 
     #[test]
+    fn gateway_usage_queue_workers_manual_override_wins_and_is_capped() {
+        let mut args = test_args();
+        args.usage.queue_workers = Some(72);
+        let database = test_database(DatabaseDriver::Postgres, 100);
+
+        let workers = args.usage.effective_queue_workers(
+            NodeRoleArg::All,
+            Some(10_000),
+            None,
+            Some(&database),
+        );
+
+        assert_eq!(workers, 64);
+        assert_eq!(args.usage.to_config(workers, 64).worker_count, 64);
+    }
+
+    #[test]
+    fn gateway_usage_queue_workers_auto_uses_cpu_default_without_concurrency_hint() {
+        let database = test_database(DatabaseDriver::Postgres, 100);
+
+        let workers = automatic_usage_queue_workers_for_parallelism(
+            4,
+            NodeRoleArg::All,
+            None,
+            None,
+            Some(&database),
+        );
+
+        assert_eq!(workers, 4);
+    }
+
+    #[test]
+    fn gateway_usage_queue_worker_autoscale_max_uses_database_cap() {
+        let mut args = test_args();
+        args.usage.queue_workers = None;
+        let database = test_database(DatabaseDriver::Postgres, 40);
+
+        let workers =
+            args.usage
+                .effective_queue_workers(args.node_role, None, None, Some(&database));
+        let max_workers =
+            args.usage
+                .effective_queue_worker_max_count(args.node_role, Some(&database), workers);
+
+        assert_eq!(workers, 8);
+        assert_eq!(max_workers, 10);
+    }
+
+    #[test]
+    fn gateway_usage_queue_worker_autoscale_max_respects_explicit_override() {
+        let mut args = test_args();
+        args.usage.queue_workers = None;
+        args.usage.queue_worker_max_count = Some(32);
+        let database = test_database(DatabaseDriver::Postgres, 100);
+
+        let workers =
+            args.usage
+                .effective_queue_workers(args.node_role, None, None, Some(&database));
+        let max_workers =
+            args.usage
+                .effective_queue_worker_max_count(args.node_role, Some(&database), workers);
+
+        assert_eq!(workers, 8);
+        assert_eq!(max_workers, 32);
+    }
+
+    #[test]
+    fn gateway_usage_queue_blocking_stream_lanes_only_expand_when_worker_can_spawn() {
+        let database = test_database(DatabaseDriver::Postgres, 100);
+        let args = test_args();
+
+        assert_eq!(
+            args.usage
+                .runtime_state_blocking_stream_lanes(NodeRoleArg::All, Some(&database), 10,),
+            Some(10)
+        );
+        assert_eq!(
+            args.usage.runtime_state_blocking_stream_lanes(
+                NodeRoleArg::Frontdoor,
+                Some(&database),
+                10,
+            ),
+            None
+        );
+        assert_eq!(
+            args.usage
+                .runtime_state_blocking_stream_lanes(NodeRoleArg::All, None, 10),
+            None
+        );
+
+        let mut disabled_queue_args = args;
+        disabled_queue_args.usage.queue_terminal_events = false;
+        disabled_queue_args.usage.queue_lifecycle_events = false;
+        assert_eq!(
+            disabled_queue_args
+                .usage
+                .runtime_state_blocking_stream_lanes(NodeRoleArg::All, Some(&database), 10,),
+            None
+        );
+    }
+
+    #[test]
+    fn gateway_usage_queue_workers_auto_scales_from_request_concurrency() {
+        let database = test_database(DatabaseDriver::Postgres, 100);
+
+        let workers = automatic_usage_queue_workers_for_parallelism(
+            8,
+            NodeRoleArg::All,
+            Some(1_536),
+            None,
+            Some(&database),
+        );
+
+        assert_eq!(workers, 12);
+    }
+
+    #[test]
+    fn gateway_usage_queue_workers_auto_respects_effective_request_limit() {
+        let database = test_database(DatabaseDriver::Postgres, 100);
+
+        let workers = automatic_usage_queue_workers_for_parallelism(
+            8,
+            NodeRoleArg::All,
+            Some(2_048),
+            Some(256),
+            Some(&database),
+        );
+
+        assert_eq!(workers, 2);
+    }
+
+    #[test]
+    fn gateway_usage_queue_workers_auto_is_capped_by_database_pool() {
+        let database = test_database(DatabaseDriver::Postgres, 20);
+
+        let workers = automatic_usage_queue_workers_for_parallelism(
+            16,
+            NodeRoleArg::All,
+            Some(5_000),
+            None,
+            Some(&database),
+        );
+
+        assert_eq!(workers, 5);
+    }
+
+    #[test]
+    fn gateway_usage_queue_workers_auto_gives_background_nodes_more_pool_budget() {
+        let database = test_database(DatabaseDriver::Postgres, 20);
+
+        let workers = automatic_usage_queue_workers_for_parallelism(
+            16,
+            NodeRoleArg::Background,
+            Some(5_000),
+            None,
+            Some(&database),
+        );
+
+        assert_eq!(workers, 10);
+    }
+
+    #[test]
+    fn gateway_usage_queue_workers_auto_uses_single_worker_for_sqlite() {
+        let database = test_database(DatabaseDriver::Sqlite, 1);
+
+        let workers = automatic_usage_queue_workers_for_parallelism(
+            16,
+            NodeRoleArg::All,
+            Some(5_000),
+            None,
+            Some(&database),
+        );
+
+        assert_eq!(workers, 1);
+    }
+
+    #[test]
     fn gateway_data_pool_explicit_values_override_auto_sizing() {
         let mut args = test_args();
         args.data.database_driver = Some(DatabaseDriverArg::Sqlite);
@@ -2355,8 +2784,10 @@ mod tests {
         let config = args.runtime_state_config(
             RuntimeBackendArg::Redis,
             args.data.effective_redis_url().as_deref(),
+            Some(7),
         );
 
+        assert_eq!(config.blocking_stream_lanes, Some(7));
         assert_eq!(
             config
                 .redis

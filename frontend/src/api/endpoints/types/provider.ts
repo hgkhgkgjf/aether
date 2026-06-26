@@ -808,6 +808,7 @@ export interface PoolAdvancedConfig {
   account_self_check_interval_minutes?: number | null
   account_self_check_concurrency?: number | null
   auto_remove_banned_keys?: boolean
+  auto_remove_quota_exhausted_keys?: boolean
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
