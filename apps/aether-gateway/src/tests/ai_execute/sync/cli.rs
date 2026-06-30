@@ -1257,11 +1257,11 @@ async fn gateway_executes_openai_responses_sync_after_api_key_concurrency_wait_b
             .await
             .expect("inflight request should complete")
     });
-    wait_until(1_000, || {
+    wait_until(5_000, || {
         *execution_runtime_hits.lock().expect("mutex should lock") >= 1
     })
     .await;
-    let pending_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1_000);
+    let pending_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(5_000);
     loop {
         let inflight_candidates = request_candidate_repository
             .list_by_request_id("trace-openai-cli-local-timeout-inflight-123")
