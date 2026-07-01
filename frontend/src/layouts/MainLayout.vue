@@ -5,12 +5,6 @@
     :sidebar-class="sidebarClasses"
     :content-class="contentClasses"
   >
-    <!-- GLOBAL TEXTURE (Paper Noise) -->
-    <div
-      class="absolute inset-0 pointer-events-none z-0 opacity-[0.03] mix-blend-multiply fixed"
-      :style="{ backgroundImage: `url(\&quot;data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E\&quot;)` }"
-    />
-
     <template #notice>
       <div class="flex w-full max-w-3xl items-center justify-between rounded-3xl bg-orange-500 px-6 py-3 text-white shadow-2xl ring-1 ring-white/30">
         <div class="flex items-center gap-3">
@@ -197,8 +191,6 @@
                       :class="isNavActive(item.href)
                         ? 'bg-[#cc785c]/10 dark:bg-[#cc785c]/20 text-[#cc785c] dark:text-[#d4a27f]'
                         : 'text-[#666663] dark:text-muted-foreground hover:bg-black/5 dark:hover:bg-white/5 hover:text-[#191919] dark:hover:text-white'"
-                      @mouseenter="prefetchNavigationItem(item.href)"
-                      @focus="prefetchNavigationItem(item.href)"
                       @pointerdown="prefetchNavigationItem(item.href)"
                       @click="mobileMenuOpen = false"
                     >
@@ -479,8 +471,13 @@ const preparedUpdateVersion = ref<string | null>(
 const SOURCE_BUILD_UPDATE_HINT: MessageKey = 'update.error.sourceBuildUpdateHint'
 const SOURCE_BUILD_RELEASE_HINT: MessageKey = 'update.error.sourceBuildReleaseHint'
 const MANUAL_UPDATE_HINT: MessageKey = 'update.error.manualHint'
+const VERSION_STATUS_CACHE_KEY = 'aether_version_status_cache'
+const VERSION_STATUS_CACHE_TTL_MS = 20 * 60 * 1000
+const VERSION_STATUS_ERROR_CACHE_TTL_MS = 5 * 60 * 1000
 let versionStatusLoadPromise: Promise<CheckUpdateResponse | null> | null = null
 let updateStatusPollTimer: number | null = null
+let updateCheckTimer: number | null = null
+let requiredAnnouncementsPromise: Promise<void> | null = null
 const updateProgressPercent = computed(() => updateTaskStatus.value?.progress_percent ?? null)
 const updateProgressText = computed(() => formatUpdateProgressText(updateTaskStatus.value))
 const updateDialogTitle = computed(() => {
@@ -538,6 +535,44 @@ function removeSessionStorageItem(key: string) {
   } catch {
     // Ignore storage failures; update state still lives in memory for this page.
   }
+}
+
+function readCachedVersionStatus(): CheckUpdateResponse | null {
+  const raw = readSessionStorageItem(VERSION_STATUS_CACHE_KEY)
+  if (!raw) return null
+
+  try {
+    const parsed = JSON.parse(raw) as { cachedAt?: unknown; status?: unknown }
+    const cachedAt = typeof parsed.cachedAt === 'number' ? parsed.cachedAt : 0
+    const status = parsed.status as CheckUpdateResponse | undefined
+    if (!status || typeof status !== 'object') return null
+
+    const ttl = status.error ? VERSION_STATUS_ERROR_CACHE_TTL_MS : VERSION_STATUS_CACHE_TTL_MS
+    if (Date.now() - cachedAt > ttl) {
+      removeSessionStorageItem(VERSION_STATUS_CACHE_KEY)
+      return null
+    }
+    return status
+  } catch {
+    removeSessionStorageItem(VERSION_STATUS_CACHE_KEY)
+    return null
+  }
+}
+
+function cacheVersionStatus(status: CheckUpdateResponse | null) {
+  if (!status) return
+  setSessionStorageItem(
+    VERSION_STATUS_CACHE_KEY,
+    JSON.stringify({ cachedAt: Date.now(), status })
+  )
+}
+
+function applyCachedVersionStatus(): boolean {
+  const cached = readCachedVersionStatus()
+  if (!cached) return false
+  versionStatus.value = cached
+  syncSystemUpdatePhase(cached)
+  return true
 }
 
 function formatUpdateProgressText(status: UpdateTaskStatusResponse | null): string {
@@ -641,6 +676,9 @@ function shouldShowUpdatePrompt(latestVersion: string): boolean {
 
 async function loadVersionStatus(force = false) {
   if (!isAdmin.value) return null
+  if (!force && applyCachedVersionStatus()) {
+    return versionStatus.value
+  }
   if (versionStatusLoadPromise) return versionStatusLoadPromise
 
   loadingVersionStatus.value = true
@@ -661,9 +699,11 @@ async function loadVersionStatus(force = false) {
           }
         : status
       syncSystemUpdatePhase(versionStatus.value)
+      cacheVersionStatus(versionStatus.value)
       return versionStatus.value
     } catch (error) {
       versionStatus.value = buildUpdateErrorStatus(versionStatus.value, error)
+      cacheVersionStatus(versionStatus.value)
       return versionStatus.value
     } finally {
       loadingVersionStatus.value = false
@@ -928,7 +968,10 @@ async function checkForUpdate() {
 
   // 同一会话内只检查一次
   const sessionKey = 'aether_update_checked'
-  if (sessionStorage.getItem(sessionKey)) return
+  if (sessionStorage.getItem(sessionKey)) {
+    applyCachedVersionStatus()
+    return
+  }
   sessionStorage.setItem(sessionKey, '1')
 
   const result = versionStatus.value ?? await loadVersionStatus()
@@ -973,12 +1016,20 @@ watch(
 
 async function loadRequiredAnnouncements() {
   if (!authStore.user || !authStore.token) return
-  try {
-    const response = await announcementApi.getRequiredUnreadAnnouncements()
-    requiredAnnouncements.value = response.items.filter(item => item.requires_ack && !item.is_read)
-  } catch {
-    requiredAnnouncements.value = []
-  }
+  if (requiredAnnouncementsPromise) return requiredAnnouncementsPromise
+
+  requiredAnnouncementsPromise = (async () => {
+    try {
+      const response = await announcementApi.getRequiredUnreadAnnouncements()
+      requiredAnnouncements.value = response.items.filter(item => item.requires_ack && !item.is_read)
+    } catch {
+      requiredAnnouncements.value = []
+    } finally {
+      requiredAnnouncementsPromise = null
+    }
+  })()
+
+  return requiredAnnouncementsPromise
 }
 
 function renderRequiredAnnouncement(content: string): string {
@@ -1005,16 +1056,19 @@ onMounted(() => {
   window.addEventListener('storage', handleStorageChange)
   document.addEventListener('visibilitychange', handleVisibilityChange)
   syncAuthNotice()
+  applyCachedVersionStatus()
 
   // 管理员预加载模块状态（路由守卫会按需加载，这里提前加载以避免菜单闪烁）
   if (authStore.canAccessAdmin && !moduleStore.loaded && !moduleStore.loading) {
-    moduleStore.fetchModules()
+    void moduleStore.fetchModules().catch(() => {
+      // 路由守卫会在需要模块状态时按需处理失败场景。
+    })
   }
-  void loadVersionStatus()
   void loadRequiredAnnouncements()
 
-  // 延迟检查更新，避免影响页面加载
-  setTimeout(() => {
+  // 延迟检查更新，避免 GitHub Releases 检查和首屏业务数据争抢资源。
+  updateCheckTimer = window.setTimeout(() => {
+    updateCheckTimer = null
     void checkForUpdate()
   }, 2000)
 
@@ -1027,6 +1081,10 @@ onMounted(() => {
 onUnmounted(() => {
   window.removeEventListener('storage', handleStorageChange)
   document.removeEventListener('visibilitychange', handleVisibilityChange)
+  if (updateCheckTimer !== null) {
+    window.clearTimeout(updateCheckTimer)
+    updateCheckTimer = null
+  }
   stopUpdateStatusPolling()
   if (import.meta.env.DEV && window.__aetherShowUpdateDialog === showDebugUpdateDialog) {
     delete window.__aetherShowUpdateDialog
