@@ -160,14 +160,14 @@
         <Transition
           enter-active-class="transition-all duration-300 ease-out overflow-hidden"
           enter-from-class="opacity-0 max-h-0"
-          enter-to-class="opacity-100 max-h-[500px]"
+          enter-to-class="opacity-100 max-h-[calc(100dvh-5rem)]"
           leave-active-class="transition-all duration-200 ease-in overflow-hidden"
-          leave-from-class="opacity-100 max-h-[500px]"
+          leave-from-class="opacity-100 max-h-[calc(100dvh-5rem)]"
           leave-to-class="opacity-0 max-h-0"
         >
           <div
             v-if="mobileMenuOpen"
-            class="border-t border-[var(--shell-border)] bg-[var(--shell-glass)] backdrop-blur-xl"
+            class="max-h-[calc(100dvh-5rem)] overflow-y-auto overscroll-contain border-t border-[var(--shell-border)] bg-[var(--shell-glass)] backdrop-blur-xl"
           >
             <div class="mx-auto max-w-7xl px-6 py-4">
               <!-- Navigation Groups -->

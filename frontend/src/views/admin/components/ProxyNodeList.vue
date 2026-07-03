@@ -1,16 +1,16 @@
 <template>
   <div class="hidden xl:block overflow-x-auto">
-    <Table>
+    <Table class="min-w-[1040px] table-fixed">
       <TableHeader>
         <TableRow class="border-b border-border/60 hover:bg-transparent">
           <TableHead class="w-[28px] min-w-[28px] max-w-[28px] h-12 p-0 pl-2" />
-          <TableHead class="w-[160px] h-12 font-semibold">
+          <TableHead class="w-[150px] h-12 font-semibold">
             {{ legacyT('名称') }}
           </TableHead>
-          <TableHead class="w-[180px] h-12 font-semibold">
+          <TableHead class="w-[190px] h-12 font-semibold">
             {{ legacyT('地址') }}
           </TableHead>
-          <TableHead class="w-[100px] h-12 font-semibold">
+          <TableHead class="w-[90px] h-12 font-semibold">
             {{ legacyT('区域') }}
           </TableHead>
           <SortableTableHead
@@ -32,22 +32,22 @@
               />
             </template>
           </SortableTableHead>
-          <TableHead class="w-[100px] h-12 font-semibold text-center">
+          <TableHead class="w-[86px] h-12 font-semibold text-center">
             {{ legacyT('总请求') }}
           </TableHead>
-          <TableHead class="w-[100px] h-12 font-semibold text-center">
+          <TableHead class="w-[86px] h-12 font-semibold text-center">
             {{ legacyT('失败率') }}
           </TableHead>
-          <TableHead class="w-[100px] h-12 font-semibold text-center">
+          <TableHead class="w-[86px] h-12 font-semibold text-center">
             {{ legacyT('延迟') }}
           </TableHead>
-          <TableHead class="w-[120px] h-12 font-semibold text-center">
+          <TableHead class="w-[90px] h-12 font-semibold text-center">
             {{ legacyT('版本') }}
           </TableHead>
-          <TableHead class="w-[160px] h-12 font-semibold">
+          <TableHead class="w-[130px] h-12 font-semibold">
             {{ legacyT('最后心跳') }}
           </TableHead>
-          <TableHead class="w-[140px] h-12 font-semibold text-center">
+          <TableHead class="w-[120px] h-12 font-semibold text-center">
             {{ legacyT('操作') }}
           </TableHead>
         </TableRow>
