@@ -167,7 +167,7 @@
         >
           <div
             v-if="mobileMenuOpen"
-            class="fixed inset-x-0 bottom-0 top-[73px] overflow-y-scroll overscroll-contain border-t border-[var(--shell-border)] bg-[var(--shell-glass)] backdrop-blur-xl [-webkit-overflow-scrolling:touch] touch-pan-y"
+            class="absolute inset-x-0 top-full max-h-[calc(100dvh-73px)] overflow-y-auto overscroll-contain border-t border-[var(--shell-border)] bg-[var(--shell-glass)] shadow-xl backdrop-blur-xl [-webkit-overflow-scrolling:touch] touch-pan-y"
           >
             <div class="mx-auto max-w-7xl px-6 py-4 pb-28">
               <div class="space-y-4">
